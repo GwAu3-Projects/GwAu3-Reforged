@@ -1,0 +1,55 @@
+# Project specific
+*.txt
+*.ini
+
+/Extend/*
+/Scripts/*
+
+!/Scripts/Exemples/
+!/Scripts/Tools/
+!/Scripts/Multi-Launcher/
+
+# Build directories
+build/
+out/
+cmake-build-*/
+
+# Visual Studio
+.vs/
+*.vcxproj.user
+*.suo
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+ipch/
+
+# Compiled binaries
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.obj
+*.o
+
+# Precompiled headers
+*.pch
+*.gch
+
+# CMake generated
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# IDE
+.idea/
+*.code-workspace
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log
