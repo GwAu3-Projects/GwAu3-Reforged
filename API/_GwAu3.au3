@@ -155,3 +155,6 @@
 #include "Core/GwNexusClient.au3"
 #include "Core/GwNexusFunctions.au3"
 #include "Core/GwNexusProtocol.au3"
+
+#include "GwAu3_Const_LogMessage.au3"
+#include "GwAu3_Core_LogMessages.au3"

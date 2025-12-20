@@ -9,10 +9,20 @@
 !/Scripts/Tools/
 !/Scripts/Multi-Launcher/
 
+# Dependencies (downloaded by setup.bat)
+API/Dll/Dependencies/minhook/
+API/Dll/Dependencies/directxtex/
+API/Dll/Dependencies/imgui/
+API/Dll/Dependencies/json/
+
 # Build directories
 build/
 out/
 cmake-build-*/
+API/Dll/Dependencies/
+API/Dll/build/
+API/Dll/Debug/
+API/Dll/Release/
 
 # Visual Studio
 .vs/

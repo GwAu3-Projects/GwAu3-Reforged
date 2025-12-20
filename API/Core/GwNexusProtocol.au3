@@ -359,6 +359,13 @@ Func _GwNexus_CreateDLLStatusRequest()
     Return $tRequest
 EndFunc
 
+; Create DLL detach request (eject DLL from target process)
+Func _GwNexus_CreateDLLDetachRequest()
+    Local $tRequest = DllStructCreate("int type")
+    DllStructSetData($tRequest, "type", $REQUEST_DLL_DETACH)
+    Return $tRequest
+EndFunc
+
 ; Create list functions request
 Func _GwNexus_CreateListFunctionsRequest()
     Local $tRequest = DllStructCreate("int type")

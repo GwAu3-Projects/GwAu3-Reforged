@@ -7,7 +7,10 @@
 #include <deque>
 #include <mutex>
 #include <chrono>
+
+#ifdef _DEBUG
 #include <imgui.h>
+#endif
 
 // Assertion macro
 #define ASSERT(expr) ((void)(!!(expr) || (Debug::FatalAssert(#expr, __FILE__, (unsigned)__LINE__, __FUNCTION__), 0)))
@@ -87,17 +90,21 @@ public:
         va_list args
     );
 
-    // ImGui rendering
+#ifdef _DEBUG
+    // ImGui rendering (debug mode only)
     void Draw();
     void ToggleWindow();
     bool IsWindowVisible() const { return showDebugWindow; }
+#endif
 
     // Clear logs
     void Clear();
 
-    // Copy logs to clipboard
+#ifdef _DEBUG
+    // Copy logs to clipboard (uses ImGui clipboard)
     void CopyLogsToClipboard();
     void CopyFilteredLogsToClipboard();
+#endif
 
 private:
     struct LogEntry {
@@ -147,13 +154,15 @@ private:
     void InternalLog(LogLevel level, const char* message, const char* file,
         unsigned int line, const char* function);
 
-    // ImGui helpers
-    void DrawControlPanel();
-    void DrawLogPanel();
-
     // Utility functions
     const char* GetLogLevelString(LogLevel level) const;
-    ImVec4 GetLogLevelColor(LogLevel level) const;
     std::string FormatTimestamp(const std::chrono::system_clock::time_point& time) const;
     std::string GetShortFileName(const std::string& fullPath) const;
+
+#ifdef _DEBUG
+    // ImGui helpers (debug mode only)
+    void DrawControlPanel();
+    void DrawLogPanel();
+    ImVec4 GetLogLevelColor(LogLevel level) const;
+#endif
 };

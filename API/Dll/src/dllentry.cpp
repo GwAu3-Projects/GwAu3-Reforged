@@ -3,20 +3,23 @@
 #include "Utilities/Scanner.h"
 #include "DllState.h"
 #include "NamedPipe/NamedPipeServer.h"
-#include "NamedPipe/NamedPipeUI.h"
 #include "NamedPipe/RPCBridge.h"
 #include <MinHook.h>
 #include <d3d9.h>
+
+#ifdef _DEBUG
+#include "NamedPipe/NamedPipeUI.h"
 #include <imgui.h>
 #include <imgui_impl_dx9.h>
 #include <imgui_impl_win32.h>
 
 // ================================
-// ImGui Integration
+// ImGui Integration (Debug only)
 // ================================
 
 // ImGui WndProc handler
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+#endif
 
 // ================================
 // DLL State Management (Thread-Safe)
@@ -66,20 +69,26 @@ typedef HRESULT(WINAPI* Reset_t)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
 EndScene_t g_EndScene_Original = nullptr;
 Reset_t g_Reset_Original = nullptr;
 
-// ImGui state
-bool g_imguiInitialized = false;
-bool g_showMainWindow = false;  // Changed to false by default, will be enabled only in debug mode
+// Window hook
 HWND g_gameWindow = nullptr;
 WNDPROC g_originalWndProc = nullptr;
 
-// Mouse tracking
+#ifdef _DEBUG
+// ImGui state (debug only)
+bool g_imguiInitialized = false;
+bool g_showMainWindow = false;
+
+// Mouse tracking (debug only)
 static bool g_rightMouseDown = false;
 static bool g_isDragging = false;
 static bool g_isDraggingImgui = false;
+#endif
 
-//NamedPipe Server
+// NamedPipe Server
 GW::NamedPipeServer* g_pipeServer = nullptr;
+#ifdef _DEBUG
 GW::NamedPipeUI* g_pipeUI = nullptr;
+#endif
 
 // ================================
 // WndProc Hook
@@ -472,7 +481,11 @@ HRESULT WINAPI OnEndScene(IDirect3DDevice9* device) {
     }
 
     // Process pending RPC calls in game thread context
+#ifdef _DEBUG
     if (g_pipeServer || g_pipeUI) {
+#else
+    if (g_pipeServer) {
+#endif
         GW::RPCBridge::GetInstance().ProcessPendingCalls();
     }
 
@@ -561,6 +574,13 @@ bool GetD3D9VTable(void** vtable, size_t size) {
 DWORD WINAPI MainThread(LPVOID param) {
     HMODULE hModule = (HMODULE)param;
 
+    // Initialize Debug system FIRST so logging works
+    try {
+        Debug::RegisterLogHandler(nullptr, nullptr);
+    } catch (...) {
+        return EXIT_FAILURE;
+    }
+
     LOG_INFO("===========================================");
     LOG_INFO("GwAu3 DLL Starting");
 #ifdef _DEBUG
@@ -572,9 +592,6 @@ DWORD WINAPI MainThread(LPVOID param) {
 
     // Set state to running
     GW::g_dllState = GW::DllState::Running;
-
-    // Initialize Debug system
-    Debug::RegisterLogHandler(nullptr, nullptr);
 
     // Initialize MinHook
     if (MH_Initialize() != MH_OK) {

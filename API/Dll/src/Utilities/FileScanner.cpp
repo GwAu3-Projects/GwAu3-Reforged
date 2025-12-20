@@ -322,9 +322,19 @@ uintptr_t FileScanner::FindAssertion(const char* assertion_file, const char* ass
 
 uintptr_t FileScanner::FindInRange(const char* pattern, const char* mask, int offset, uint32_t start, uint32_t end)
 {
+    // Safety check: if sections are not initialized, return 0
+    if (start == 0 || end == 0) {
+        return 0;
+    }
+
     char first = pattern[0];
     size_t patternLength = strlen(mask ? mask : pattern);
     bool found = false;
+
+    // Safety check: prevent underflow
+    if (end < patternLength) {
+        return 0;
+    }
     end -= patternLength;
 
     if (start > end) {

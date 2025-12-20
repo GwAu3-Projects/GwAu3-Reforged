@@ -40,6 +40,10 @@ uintptr_t GW::Scanner::FindAssertion(const char* assertion_file, const char* ass
     return found ? found - section_offset_from_disk : found;
 }
 uintptr_t GW::Scanner::FindInRange(const char* pattern, const char* mask, int offset, DWORD start, DWORD end) {
+    // Safety check: if invalid range, return 0
+    if (start == 0 || end == 0) {
+        return 0;
+    }
     const auto found = fileScanner.FindInRange(pattern, mask, offset, start + section_offset_from_disk, end + section_offset_from_disk);
     return found ? found - section_offset_from_disk : found;
 }
@@ -47,6 +51,10 @@ void GW::Scanner::GetSectionAddressRange(ScannerSection section, uintptr_t* star
     return fileScanner.GetSectionAddressRange(section, start, end);
 }
 uintptr_t GW::Scanner::Find(const char* pattern, const char* mask, int offset, ScannerSection section) {
+    // Safety check: if sections are not initialized, return 0
+    if (mem_sections[section].start == 0 || mem_sections[section].end == 0) {
+        return 0;
+    }
     return FindInRange(pattern, mask, offset, mem_sections[section].start, mem_sections[section].end);
 }
 

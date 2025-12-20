@@ -6,11 +6,91 @@
 #include <sstream>
 #include <iomanip>
 
+// Get character name from game memory (with retry)
+std::wstring GetCharacterName() {
+    // Pattern to find character name: 8B F8 6A 03 68 0F 00 00 C0 8B CF E8
+    static const char pattern[] = "\x8B\xF8\x6A\x03\x68\x0F\x00\x00\xC0\x8B\xCF\xE8";
+    static const char* mask = "xxxxxxxxxxxx";
+    static uintptr_t cachedPatternAddr = 0;
+
+    // Find pattern once and cache it
+    if (cachedPatternAddr == 0) {
+        cachedPatternAddr = GW::Scanner::Find(pattern, mask, 0);
+        if (cachedPatternAddr == 0) {
+            LOG_WARN("Character name pattern not found");
+            return L"";
+        }
+    }
+
+    // The pointer to character name is at patternAddr - 0x42
+    uintptr_t namePtr = *(uintptr_t*)(cachedPatternAddr - 0x42);
+    if (namePtr == 0) {
+        return L"";  // Character not loaded yet, don't log warning
+    }
+
+    // Read the wide character name (max 30 chars)
+    wchar_t* nameAddr = (wchar_t*)namePtr;
+
+    // Check if it's a valid pointer
+    if (IsBadReadPtr(nameAddr, sizeof(wchar_t))) {
+        return L"";
+    }
+
+    std::wstring name(nameAddr, wcsnlen(nameAddr, 30));
+
+    // Return empty if name is empty or just whitespace
+    if (name.empty() || name[0] == L'\0') {
+        return L"";
+    }
+
+    return name;
+}
+
+// Wait for character name to be available (with timeout)
+std::wstring WaitForCharacterName(int maxRetries = 50, int delayMs = 100) {
+    for (int i = 0; i < maxRetries; i++) {
+        std::wstring name = GetCharacterName();
+        if (!name.empty()) {
+            LOG_INFO("Character name found after %d ms: %S", i * delayMs, name.c_str());
+            return name;
+        }
+        Sleep(delayMs);
+    }
+    LOG_WARN("Character name not found after %d retries (%d ms)", maxRetries, maxRetries * delayMs);
+    return L"";
+}
+
+// Convert wide string to UTF-8
+std::string WideToUtf8(const std::wstring& wide) {
+    if (wide.empty()) return "";
+
+    int size = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (size <= 0) return "";
+
+    std::string utf8(size - 1, 0);
+    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, &utf8[0], size, nullptr, nullptr);
+    return utf8;
+}
+
 std::string GetPipeName() {
     static std::string pipeName;
     if (pipeName.empty()) {
+        // Try to get character name first
+        std::wstring charName = GetCharacterName();
         std::stringstream ss;
-        ss << "\\\\.\\pipe\\GwNexus_" << GetCurrentProcessId();
+
+        if (!charName.empty()) {
+            // Replace spaces with underscores in character name
+            for (auto& c : charName) {
+                if (c == L' ') c = L'_';
+            }
+            ss << "\\\\.\\pipe\\GwNexus_" << WideToUtf8(charName);
+            LOG_INFO("Pipe name set to character: %s", WideToUtf8(charName).c_str());
+        } else {
+            // Fallback to PID if character name not found
+            ss << "\\\\.\\pipe\\GwNexus_" << GetCurrentProcessId();
+            LOG_WARN("Using PID for pipe name (character not found)");
+        }
         pipeName = ss.str();
     }
     return pipeName;
@@ -140,8 +220,31 @@ namespace GW {
         }
     }
 
-    bool NamedPipeServer::Start(const std::string& pipeName) {
-        std::string actualPipeName = pipeName.empty() ? GetPipeName() : pipeName;
+    bool NamedPipeServer::Start(const std::string& pipeNameParam) {
+        // Generate pipe name directly here to avoid any static variable issues
+        std::string actualPipeName;
+        if (pipeNameParam.empty()) {
+            // Try to get character name first
+            std::wstring charName = GetCharacterName();
+            std::stringstream ss;
+
+            if (!charName.empty()) {
+                // Replace spaces with underscores in character name
+                for (auto& c : charName) {
+                    if (c == L' ') c = L'_';
+                }
+                ss << "\\\\.\\pipe\\GwNexus_" << WideToUtf8(charName);
+                LOG_INFO("Pipe name set to character: %s", WideToUtf8(charName).c_str());
+            } else {
+                // Fallback to PID if character name not found
+                ss << "\\\\.\\pipe\\GwNexus_" << GetCurrentProcessId();
+                LOG_WARN("Using PID for pipe name (character not found)");
+            }
+            actualPipeName = ss.str();
+        } else {
+            actualPipeName = pipeNameParam;
+        }
+
         LOG_DEBUG("NamedPipeServer::Start called with pipeName: %s", actualPipeName.c_str());
 
         if (running) {
@@ -165,11 +268,33 @@ namespace GW {
         LOG_INFO("Starting Named Pipe server on: %s", actualPipeName.c_str());
 
         // Start server thread - detach to not block
-        serverThread = std::thread(&NamedPipeServer::ServerLoop, this);
-        serverThread.detach();
+        try {
+            serverThread = std::thread(&NamedPipeServer::ServerLoop, this);
+            if (serverThread.joinable()) {
+                LOG_INFO("Server thread created successfully, detaching...");
+                serverThread.detach();
+            } else {
+                LOG_ERROR("Server thread is not joinable after creation!");
+                running = false;
+                return false;
+            }
+        }
+        catch (const std::exception& e) {
+            LOG_ERROR("Failed to create server thread: %s", e.what());
+            running = false;
+            return false;
+        }
+        catch (...) {
+            LOG_ERROR("Failed to create server thread: unknown exception");
+            running = false;
+            return false;
+        }
 
         if (OnLog) OnLog("Named pipe server started on: " + actualPipeName);
         LOG_SUCCESS("Named pipe server started: %s", actualPipeName.c_str());
+
+        // Give the thread a moment to start and log its status
+        Sleep(100);
 
         return true;
     }
@@ -282,15 +407,31 @@ namespace GW {
     }
 
     void NamedPipeServer::ServerLoop() {
-        LOG_DEBUG("ServerLoop thread started, ThreadID: %lu", GetCurrentThreadId());
+        LOG_INFO("ServerLoop thread STARTED, ThreadID: %lu, PipeName: %s",
+            GetCurrentThreadId(), pipeName.c_str());
+
+        // Validate pipe name before proceeding
+        if (pipeName.empty()) {
+            LOG_ERROR("ServerLoop: pipeName is EMPTY! Cannot create pipe.");
+            running = false;
+            return;
+        }
 
         // Set thread priority
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 
         // Security descriptor
         SECURITY_DESCRIPTOR sd;
-        InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
-        SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);
+        if (!InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION)) {
+            LOG_ERROR("Failed to initialize security descriptor: %lu", GetLastError());
+            running = false;
+            return;
+        }
+        if (!SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE)) {
+            LOG_ERROR("Failed to set security descriptor DACL: %lu", GetLastError());
+            running = false;
+            return;
+        }
 
         SECURITY_ATTRIBUTES sa;
         sa.nLength = sizeof(SECURITY_ATTRIBUTES);
@@ -307,7 +448,7 @@ namespace GW {
                 break;
             }
 
-            LOG_DEBUG("Creating named pipe instance #%d", ++connectionCount);
+            LOG_INFO("Creating named pipe instance #%d on: %s", ++connectionCount, pipeName.c_str());
 
             // Create named pipe with overlapped I/O
             HANDLE newPipe = CreateNamedPipeA(
@@ -323,7 +464,7 @@ namespace GW {
 
             if (newPipe == INVALID_HANDLE_VALUE) {
                 DWORD error = GetLastError();
-                LOG_ERROR("Failed to create named pipe: %lu", error);
+                LOG_ERROR("FAILED to create named pipe '%s': error=%lu", pipeName.c_str(), error);
 
                 if (running && !GW::IsDllShuttingDown()) {
                     if (OnError) OnError("Failed to create named pipe: " + std::to_string(error));
@@ -334,7 +475,8 @@ namespace GW {
 
             hPipe = newPipe;
 
-            LOG_DEBUG("Named pipe created, waiting for client...");
+            LOG_SUCCESS("Named pipe CREATED successfully: %s (handle=0x%p)", pipeName.c_str(), newPipe);
+            LOG_INFO("Waiting for client connection...");
 
             // Use overlapped structure for async operations
             OVERLAPPED overlapped = {};

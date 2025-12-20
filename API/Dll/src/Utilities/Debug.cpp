@@ -1,6 +1,10 @@
 #include "Utilities/Debug.h"
 #include <cstdarg>
 #include <algorithm>
+#include <ctime>
+#include <Psapi.h>  // For EnumProcessModules
+
+#pragma comment(lib, "Psapi.lib")
 
 // Static member initialization
 Debug* Debug::instance = nullptr;
@@ -149,14 +153,97 @@ void Debug::InternalLog(LogLevel level, const char* message, const char* file,
         logs.pop_front();
     }
 
-    // Output to console in debug mode
 #ifdef _DEBUG
+    // Output to console in debug mode
     const char* levelStr = GetLogLevelString(level);
     if (showFileInfo) {
         printf("[%s] %s (%s:%u in %s)\n", levelStr, message, file, line, function);
     }
     else {
         printf("[%s] %s\n", levelStr, message);
+    }
+#else
+    // In release mode, write important logs to file AND OutputDebugString for debugging
+    if (level >= LogLevel::Info) {
+        // Get level string (static helper to avoid instance requirement)
+        const char* levelStr = "UNKNOWN";
+        switch (level) {
+        case LogLevel::Trace:    levelStr = "TRACE"; break;
+        case LogLevel::Debug:    levelStr = "DEBUG"; break;
+        case LogLevel::Info:     levelStr = "INFO"; break;
+        case LogLevel::Warning:  levelStr = "WARN"; break;
+        case LogLevel::Error:    levelStr = "ERROR"; break;
+        case LogLevel::Critical: levelStr = "CRITICAL"; break;
+        case LogLevel::Success:  levelStr = "OK"; break;
+        }
+
+        // Format for OutputDebugString (visible in DebugView or Visual Studio)
+        char debugBuffer[1200];
+        snprintf(debugBuffer, sizeof(debugBuffer), "[GwNexus][%s] %s\n", levelStr, message);
+        OutputDebugStringA(debugBuffer);
+
+        // Also write to log file (in same folder as DLL)
+        static FILE* logFile = nullptr;
+        static bool logFileOpened = false;
+        static char staticMarker = 'X'; // Used to get DLL module handle
+        if (!logFileOpened) {
+            logFileOpened = true;
+
+            char logPath[MAX_PATH] = {0};
+
+            // Try method 1: Use address of static variable in this DLL
+            HMODULE hDllModule = nullptr;
+            if (GetModuleHandleExA(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                (LPCSTR)&staticMarker,
+                &hDllModule) && hDllModule) {
+                GetModuleFileNameA(hDllModule, logPath, MAX_PATH);
+            }
+
+            // Try method 2: Look for GwNexus*.dll modules
+            if (!logPath[0]) {
+                HMODULE hMods[1024];
+                DWORD cbNeeded;
+                HANDLE hProcess = GetCurrentProcess();
+                if (EnumProcessModules(hProcess, hMods, sizeof(hMods), &cbNeeded)) {
+                    for (unsigned int i = 0; i < (cbNeeded / sizeof(HMODULE)); i++) {
+                        char modName[MAX_PATH];
+                        if (GetModuleFileNameA(hMods[i], modName, sizeof(modName))) {
+                            // Check if this is our DLL
+                            if (strstr(modName, "GwNexus") != nullptr ||
+                                strstr(modName, "gwnexus") != nullptr) {
+                                strcpy(logPath, modName);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Try method 3: Use main exe directory as fallback
+            if (!logPath[0]) {
+                GetModuleFileNameA(NULL, logPath, MAX_PATH);
+            }
+
+            if (logPath[0]) {
+                char* lastSlash = strrchr(logPath, '\\');
+                if (lastSlash) {
+                    strcpy(lastSlash + 1, "GwNexus_Release.log");
+                    logFile = fopen(logPath, "a");
+                    if (logFile) {
+                        // Write separator and timestamp at start
+                        time_t now = time(NULL);
+                        fprintf(logFile, "\n========== GwNexus Release Log Started: %s", ctime(&now));
+                        fprintf(logFile, "Log file location: %s\n", logPath);
+                        fflush(logFile);
+                    }
+                }
+            }
+        }
+        if (logFile) {
+            fprintf(logFile, "[%s] %s\n", levelStr, message);
+            fflush(logFile);
+        }
     }
 #endif
 }
@@ -169,6 +256,7 @@ void Debug::Clear() {
     }
 }
 
+#ifdef _DEBUG
 void Debug::ToggleWindow() {
     showDebugWindow = !showDebugWindow;
 }
@@ -370,6 +458,7 @@ void Debug::DrawLogPanel() {
 
     ImGui::EndChild();
 }
+#endif // _DEBUG
 
 const char* Debug::GetLogLevelString(LogLevel level) const {
     switch (level) {
@@ -384,6 +473,7 @@ const char* Debug::GetLogLevelString(LogLevel level) const {
     }
 }
 
+#ifdef _DEBUG
 ImVec4 Debug::GetLogLevelColor(LogLevel level) const {
     switch (level) {
     case LogLevel::Trace:    return ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
@@ -396,6 +486,7 @@ ImVec4 Debug::GetLogLevelColor(LogLevel level) const {
     default:                 return ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
     }
 }
+#endif
 
 std::string Debug::FormatTimestamp(const std::chrono::system_clock::time_point& time) const {
     auto time_t = std::chrono::system_clock::to_time_t(time);
@@ -422,6 +513,7 @@ std::string Debug::GetShortFileName(const std::string& fullPath) const {
     return fullPath;
 }
 
+#ifdef _DEBUG
 void Debug::CopyLogsToClipboard() {
     std::string text;
 
@@ -489,3 +581,4 @@ void Debug::CopyFilteredLogsToClipboard() {
         LOG_INFO("No filtered logs to copy");
     }
 }
+#endif // _DEBUG

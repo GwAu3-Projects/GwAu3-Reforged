@@ -1306,6 +1306,292 @@ Func _GwNexus_WaitForPipe($iPID, $iTimeoutMs = 5000)
     Return False
 EndFunc
 
+; Enumerate all GwNexus pipes by scanning GW processes and reading character names
+; Returns: 2D array [n][2] where [i][0] = character name, [i][1] = pipe name
+Func _GwNexus_EnumeratePipes()
+    Local $aPipes[0][2]
+
+    ; Get all GW windows
+    Local $aWinList = WinList("[CLASS:ArenaNet_Dx_Window_Class]")
+    If $aWinList[0][0] = 0 Then Return $aPipes
+
+    Local $hKernel = DllOpen("kernel32.dll")
+    If $hKernel = -1 Then Return $aPipes
+
+    ; Pattern to find character name
+    Local $sCharNameCode = BinaryToString("0x8BF86A03680F0000C08BCFE8")
+    Local $iCharNameRva = 0  ; Will be found once and reused
+
+    For $i = 1 To $aWinList[0][0]
+        Local $iPID = WinGetProcess($aWinList[$i][1])
+        If $iPID = 0 Then ContinueLoop
+
+        ; Open process
+        Local $aOpen = DllCall($hKernel, "handle", "OpenProcess", "dword", 0x1F0FFF, "bool", False, "dword", $iPID)
+        If @error Or $aOpen[0] = 0 Then ContinueLoop
+        Local $hProc = $aOpen[0]
+
+        ; Get module info
+        Local $iModuleBase = 0, $iModuleSize = 0
+        If Not __GwNexus_GetModuleInfo($hKernel, $hProc, $iPID, $iModuleBase, $iModuleSize) Then
+            DllCall($hKernel, "bool", "CloseHandle", "handle", $hProc)
+            ContinueLoop
+        EndIf
+
+        ; Find character name RVA if not already found
+        If $iCharNameRva = 0 Then
+            $iCharNameRva = __GwNexus_ScanForCharname($hKernel, $hProc, $iModuleBase, $iModuleSize, $sCharNameCode)
+        EndIf
+
+        If $iCharNameRva <> 0 Then
+            ; Read character name
+            Local $tName = DllStructCreate("wchar[30]")
+            Local $aRead = DllCall($hKernel, "bool", "ReadProcessMemory", _
+                "handle", $hProc, _
+                "ptr", $iModuleBase + $iCharNameRva, _
+                "struct*", $tName, _
+                "ulong_ptr", DllStructGetSize($tName), _
+                "ulong_ptr*", 0)
+
+            If Not @error And $aRead[0] Then
+                Local $sCharName = DllStructGetData($tName, 1)
+                If $sCharName <> "" Then
+                    ; Build pipe name (replace spaces with underscores)
+                    Local $sPipeName = "\\.\pipe\GwNexus_" & StringReplace($sCharName, " ", "_")
+
+                    ; Check if pipe exists by trying to wait for it briefly
+                    Local $aWait = DllCall($hKernel, "bool", "WaitNamedPipeW", "wstr", $sPipeName, "dword", 100)
+                    If Not @error And $aWait[0] <> 0 Then
+                        ; Pipe exists, add to list
+                        Local $iSize = UBound($aPipes)
+                        ReDim $aPipes[$iSize + 1][2]
+                        $aPipes[$iSize][0] = $sCharName
+                        $aPipes[$iSize][1] = $sPipeName
+                    EndIf
+                EndIf
+            EndIf
+        EndIf
+
+        DllCall($hKernel, "bool", "CloseHandle", "handle", $hProc)
+    Next
+
+    DllClose($hKernel)
+    Return $aPipes
+EndFunc
+
+; Internal: Get module base and size for a process
+Func __GwNexus_GetModuleInfo($hKernel, $hProc, $iPID, ByRef $iModuleBase, ByRef $iModuleSize)
+    Local $aModules = _WinAPI_EnumProcessModules($iPID)
+    If @error Or Not IsArray($aModules) Then Return False
+
+    Local $sProcName = _WinAPI_GetProcessName($iPID)
+    Local $iProcNameLen = StringLen($sProcName)
+
+    For $i = 1 To $aModules[0][0]
+        Local $sModName = StringRight($aModules[$i][1], $iProcNameLen)
+        If StringCompare($sModName, $sProcName, 0) = 0 Then
+            Local $tModInfo = _WinAPI_GetModuleInformation($hProc, $aModules[$i][0])
+            If @error Then Return False
+            $iModuleBase = DllStructGetData($tModInfo, "BaseOfDll")
+            $iModuleSize = DllStructGetData($tModInfo, "SizeOfImage")
+            Return True
+        EndIf
+    Next
+    Return False
+EndFunc
+
+; Internal: Scan for character name address
+Func __GwNexus_ScanForCharname($hKernel, $hProc, $iModuleBase, $iModuleSize, $sCharNameCode)
+    Local $iCurrentAddr = $iModuleBase
+    Local $tMBI = DllStructCreate("ptr;ptr;dword;ulong_ptr;dword;dword;dword")
+
+    While $iCurrentAddr < $iModuleBase + $iModuleSize
+        DllCall($hKernel, "ulong_ptr", "VirtualQueryEx", _
+            "handle", $hProc, _
+            "ptr", $iCurrentAddr, _
+            "struct*", $tMBI, _
+            "ulong_ptr", DllStructGetSize($tMBI))
+
+        Local $iRegionSize = DllStructGetData($tMBI, 4)
+        Local $iState = DllStructGetData($tMBI, 5)
+
+        If $iState = 0x1000 Then  ; MEM_COMMIT
+            Local $tBuffer = DllStructCreate("byte[" & $iRegionSize & "]")
+            Local $aRead = DllCall($hKernel, "bool", "ReadProcessMemory", _
+                "handle", $hProc, _
+                "ptr", $iCurrentAddr, _
+                "struct*", $tBuffer, _
+                "ulong_ptr", $iRegionSize, _
+                "ulong_ptr*", 0)
+
+            If Not @error And $aRead[0] Then
+                Local $sMemData = BinaryToString(DllStructGetData($tBuffer, 1))
+                Local $iSearch = StringInStr($sMemData, $sCharNameCode, 2)
+
+                If $iSearch > 0 Then
+                    Local $iTmpAddr = $iCurrentAddr + $iSearch - 1
+                    Local $tPtr = DllStructCreate("ptr")
+                    DllCall($hKernel, "bool", "ReadProcessMemory", _
+                        "handle", $hProc, _
+                        "ptr", $iTmpAddr - 0x42, _
+                        "struct*", $tPtr, _
+                        "ulong_ptr", DllStructGetSize($tPtr), _
+                        "ulong_ptr*", 0)
+                    Return DllStructGetData($tPtr, 1) - $iModuleBase
+                EndIf
+            EndIf
+        EndIf
+
+        $iCurrentAddr += $iRegionSize
+        If $iRegionSize = 0 Then ExitLoop
+    WEnd
+
+    Return 0
+EndFunc
+
+; Scan all GW clients and return character names with injection status
+; Returns: 2D array [n][3] where [i][0] = char name, [i][1] = PID, [i][2] = injected (bool)
+Func _GwNexus_ScanAllClients()
+    Local $aClients[0][3]
+
+    ; Get all GW windows
+    Local $aWinList = WinList("[CLASS:ArenaNet_Dx_Window_Class]")
+    If $aWinList[0][0] = 0 Then Return $aClients
+
+    Local $hKernel = DllOpen("kernel32.dll")
+    If $hKernel = -1 Then Return $aClients
+
+    Local $iCharNameRva = 0  ; Will be found once and reused
+
+    For $i = 1 To $aWinList[0][0]
+        Local $iPID = WinGetProcess($aWinList[$i][1])
+        If $iPID = 0 Then ContinueLoop
+
+        ; Open process
+        Local $aOpen = DllCall($hKernel, "handle", "OpenProcess", "dword", 0x1F0FFF, "bool", False, "dword", $iPID)
+        If @error Or $aOpen[0] = 0 Then ContinueLoop
+        Local $hProc = $aOpen[0]
+
+        ; Get module info
+        Local $iModuleBase = 0, $iModuleSize = 0
+        If Not __GwNexus_GetModuleInfo($hKernel, $hProc, $iPID, $iModuleBase, $iModuleSize) Then
+            DllCall($hKernel, "bool", "CloseHandle", "handle", $hProc)
+            ContinueLoop
+        EndIf
+
+        ; Find character name RVA (scan only once, reuse for all)
+        If $iCharNameRva = 0 Then
+            $iCharNameRva = __GwNexus_ScanForCharname($hKernel, $hProc, $iModuleBase, $iModuleSize, BinaryToString("0x8BF86A03680F0000C08BCFE8"))
+        EndIf
+
+        If $iCharNameRva <> 0 Then
+            ; Read character name
+            Local $tName = DllStructCreate("wchar[30]")
+            Local $aRead = DllCall($hKernel, "bool", "ReadProcessMemory", _
+                "handle", $hProc, _
+                "ptr", $iModuleBase + $iCharNameRva, _
+                "struct*", $tName, _
+                "ulong_ptr", DllStructGetSize($tName), _
+                "ulong_ptr*", 0)
+
+            If Not @error And $aRead[0] Then
+                Local $sCharName = DllStructGetData($tName, 1)
+                If $sCharName <> "" Then
+                    ; Check if pipe exists (DLL injected)
+                    Local $sPipeName = "\\.\pipe\GwNexus_" & StringReplace($sCharName, " ", "_")
+                    Local $aWait = DllCall($hKernel, "bool", "WaitNamedPipeW", "wstr", $sPipeName, "dword", 100)
+                    Local $bInjected = (Not @error And $aWait[0] <> 0)
+
+                    ; Add to list
+                    Local $iSize = UBound($aClients)
+                    ReDim $aClients[$iSize + 1][3]
+                    $aClients[$iSize][0] = $sCharName
+                    $aClients[$iSize][1] = $iPID
+                    $aClients[$iSize][2] = $bInjected
+                EndIf
+            EndIf
+        EndIf
+
+        DllCall($hKernel, "bool", "CloseHandle", "handle", $hProc)
+    Next
+
+    DllClose($hKernel)
+    Return $aClients
+EndFunc
+
+; Create connection by character name
+; Returns: Connection array on success, 0 on failure
+Func _GwNexus_CreateConnectionByName($sCharName, $iPID = 0)
+    ; Replace spaces with underscores for pipe name
+    Local $sPipeNameChar = "\\.\pipe\GwNexus_" & StringReplace($sCharName, " ", "_")
+    Local $sPipeNamePID = "\\.\pipe\GwNexus_" & $iPID
+    Local $sPipeName = ""
+
+    ; Try character name pipe first
+    Local $aWait = DllCall("kernel32.dll", "bool", "WaitNamedPipeW", _
+        "wstr", $sPipeNameChar, _
+        "dword", 2000) ; 2 second timeout
+
+    If Not @error And $aWait[0] <> 0 Then
+        $sPipeName = $sPipeNameChar
+    Else
+        ; Try PID-based pipe as fallback (release mode DLL uses this if character name not found)
+        If $iPID > 0 Then
+            $aWait = DllCall("kernel32.dll", "bool", "WaitNamedPipeW", _
+                "wstr", $sPipeNamePID, _
+                "dword", 3000) ; 3 second timeout
+
+            If Not @error And $aWait[0] <> 0 Then
+                $sPipeName = $sPipeNamePID
+            EndIf
+        EndIf
+    EndIf
+
+    If $sPipeName = "" Then
+        Return SetError(1, 0, 0) ; Pipe not available
+    EndIf
+
+    ; Try to connect to the pipe
+    Local $aResult = DllCall("kernel32.dll", "handle", "CreateFileW", _
+        "wstr", $sPipeName, _
+        "dword", 0xC0000000, _ ; GENERIC_READ | GENERIC_WRITE
+        "dword", 0, _          ; No sharing
+        "ptr", 0, _            ; Default security
+        "dword", 3, _          ; OPEN_EXISTING
+        "dword", 0x40000000, _ ; FILE_FLAG_OVERLAPPED
+        "ptr", 0)              ; No template
+
+    If @error Or $aResult[0] = -1 Or $aResult[0] = 0 Then
+        Return SetError(2, _WinAPI_GetLastError(), 0) ; Failed to open pipe
+    EndIf
+
+    Local $hPipe = $aResult[0]
+
+    ; Set pipe to message mode
+    Local $iMode = 2 ; PIPE_READMODE_MESSAGE
+    Local $aSetMode = DllCall("kernel32.dll", "bool", "SetNamedPipeHandleState", _
+        "handle", $hPipe, _
+        "dword*", $iMode, _
+        "ptr", 0, _
+        "ptr", 0)
+
+    If @error Or $aSetMode[0] = 0 Then
+        _WinAPI_CloseHandle($hPipe)
+        Return SetError(3, 0, 0) ; Failed to set mode
+    EndIf
+
+    $g_iGwNexusConnectionCounter += 1
+
+    ; Create connection object
+    Local $aConnection[4]
+    $aConnection[$CONN_HANDLE] = $hPipe
+    $aConnection[$CONN_PID] = $iPID  ; PID passed as parameter (required for proper cache keying)
+    $aConnection[$CONN_PIPENAME] = $sPipeName
+    $aConnection[$CONN_ID] = $g_iGwNexusConnectionCounter
+
+    Return $aConnection
+EndFunc
+
 ; ============================================================================
 ; Multi-Connection Extended Functions (Ex versions)
 ; These functions work with specific connection objects
