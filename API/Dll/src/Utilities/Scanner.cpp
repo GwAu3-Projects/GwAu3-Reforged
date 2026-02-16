@@ -62,7 +62,9 @@ bool GW::Scanner::IsValidPtr(uintptr_t address, ScannerSection section) {
     return address && address > mem_sections[section].start && address < mem_sections[section].end;
 }
 
-uintptr_t GW::Scanner::FunctionFromNearCall(uintptr_t call_instruction_address, bool check_valid_ptr) {
+uintptr_t GW::Scanner::FunctionFromNearCall(uintptr_t call_instruction_address, bool check_valid_ptr, int max_depth) {
+    if (max_depth <= 0)
+        return 0;
     if (!IsValidPtr(call_instruction_address, ScannerSection::Section_TEXT))
         return 0;
     uintptr_t function_address = 0;
@@ -82,7 +84,7 @@ uintptr_t GW::Scanner::FunctionFromNearCall(uintptr_t call_instruction_address, 
     if (check_valid_ptr && !IsValidPtr(function_address, ScannerSection::Section_TEXT))
         return 0;
     // Check to see if there are any nested JMP's etc
-    if (const auto nested_call = FunctionFromNearCall(function_address, check_valid_ptr)) {
+    if (const auto nested_call = FunctionFromNearCall(function_address, check_valid_ptr, max_depth - 1)) {
         return nested_call;
     }
     return function_address;

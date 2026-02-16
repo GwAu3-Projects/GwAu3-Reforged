@@ -24,17 +24,37 @@ namespace GW {
     }
 
     RPCBridge::~RPCBridge() {
-        // Clean up all allocations
-        for (auto& alloc : allocations) {
-            VirtualFree((LPVOID)alloc.second.address, 0, MEM_RELEASE);
+        // Drain all pending function calls so waiting threads are unblocked
+        {
+            std::lock_guard<std::mutex> lock(pending_calls_mutex);
+            while (!pending_calls.empty()) {
+                auto& call = pending_calls.front();
+                try {
+                    call->promise.set_value(false);
+                } catch (...) {
+                    // Promise may already be satisfied or broken
+                }
+                pending_calls.pop();
+            }
         }
-        allocations.clear();
+
+        // Clean up all allocations
+        {
+            std::lock_guard<std::mutex> lock(allocations_mutex);
+            for (auto& alloc : allocations) {
+                VirtualFree((LPVOID)alloc.second.address, 0, MEM_RELEASE);
+            }
+            allocations.clear();
+        }
 
         // Clean up hooks
-        for (auto& hook : hooks) {
-            MH_RemoveHook((LPVOID)hook.second);
+        {
+            std::lock_guard<std::mutex> lock(hooks_mutex);
+            for (auto& hook : hooks) {
+                MH_RemoveHook((LPVOID)hook.second);
+            }
+            hooks.clear();
         }
-        hooks.clear();
 
         LOG_INFO("RPCBridge destroyed");
     }
@@ -978,8 +998,23 @@ namespace GW {
                 retval = ((Func3)func.address)(args[0], args[1], args[2]);
                 break;
             }
+            case 4: {
+                typedef uintptr_t(__thiscall* Func4)(uintptr_t, uintptr_t, uintptr_t, uintptr_t);
+                retval = ((Func4)func.address)(args[0], args[1], args[2], args[3]);
+                break;
+            }
+            case 5: {
+                typedef uintptr_t(__thiscall* Func5)(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t);
+                retval = ((Func5)func.address)(args[0], args[1], args[2], args[3], args[4]);
+                break;
+            }
+            case 6: {
+                typedef uintptr_t(__thiscall* Func6)(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t);
+                retval = ((Func6)func.address)(args[0], args[1], args[2], args[3], args[4], args[5]);
+                break;
+            }
             default:
-                LOG_ERROR("Invalid parameter count for thiscall: %d", func.param_count);
+                LOG_ERROR("Too many parameters for thiscall: %d (max 6)", func.param_count);
                 return false;
             }
 
@@ -1451,8 +1486,8 @@ namespace GW {
         response.heartbeat_result.client_timestamp = clientTimestamp;
         response.heartbeat_result.server_timestamp = serverTimestamp;
 
-        // Calculate latency if client timestamp is valid (non-zero)
-        if (clientTimestamp > 0 && serverTimestamp >= clientTimestamp) {
+        // Calculate latency (unsigned subtraction handles GetTickCount wraparound correctly)
+        if (clientTimestamp > 0) {
             response.heartbeat_result.latency_ms = serverTimestamp - clientTimestamp;
         } else {
             response.heartbeat_result.latency_ms = 0;

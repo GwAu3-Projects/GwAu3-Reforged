@@ -337,6 +337,9 @@ Func _GwNexus_Connect($iPID)
         _GwNexus_Disconnect()
     EndIf
 
+    ; Clear scan cache on reconnect - addresses from a previous session are invalid
+    _GwNexus_ClearCache()
+
     ; Use the new multi-connection API internally
     $g_aGwNexusActiveConnection = _GwNexus_CreateConnection($iPID)
 

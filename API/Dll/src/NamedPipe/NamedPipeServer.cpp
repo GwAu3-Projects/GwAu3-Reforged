@@ -31,8 +31,11 @@ std::wstring GetCharacterName() {
     // Read the wide character name (max 30 chars)
     wchar_t* nameAddr = (wchar_t*)namePtr;
 
-    // Check if it's a valid pointer
-    if (IsBadReadPtr(nameAddr, sizeof(wchar_t))) {
+    // Validate pointer using VirtualQuery
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(nameAddr, &mbi, sizeof(mbi)) == 0 ||
+        mbi.State != MEM_COMMIT ||
+        !(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))) {
         return L"";
     }
 
@@ -156,6 +159,9 @@ namespace GW {
 
         return ss.str();
     }
+
+    // Server limits
+    static const DWORD MAX_PIPE_INSTANCES = 12;  // Max simultaneous client connections
 
     NamedPipeServer* NamedPipeServer::instance = nullptr;
     std::once_flag NamedPipeServer::init_flag;
@@ -284,43 +290,22 @@ namespace GW {
 
         LOG_INFO("Stopping Named Pipe server...");
 
-        // Signal shutdown
+        // Signal shutdown - ServerLoop and ProcessClient threads check this flag
         running = false;
 
-        // Set the stop event to wake up any waiting operations
+        // Set the stop event to wake up all WaitForMultipleObjects calls
+        // (both in ServerLoop and ProcessClient). This is sufficient because:
+        //  - ServerLoop's WaitForMultipleObjects includes hStopEvent
+        //  - ProcessClient's WaitForMultipleObjects includes hStopEvent
+        //  - Any code between pipe creation and wait checks 'running' flag
+        // NOTE: We do NOT manipulate hPipe here to avoid a race condition
+        // where Stop() and ServerLoop both access hPipe simultaneously.
+        // ServerLoop handles its own pipe cleanup when it detects the stop event.
         if (hStopEvent) {
             SetEvent(hStopEvent);
         }
 
-        // Close any active pipe to unblock operations
-        if (hPipe != INVALID_HANDLE_VALUE) {
-            // Cancel pending I/O
-            CancelIo(hPipe);
-
-            // Disconnect clients
-            DisconnectNamedPipe(hPipe);
-
-            // Close handle
-            CloseHandle(hPipe);
-            hPipe = INVALID_HANDLE_VALUE;
-        }
-
-        // Create a dummy connection to unblock ConnectNamedPipe if needed
-        HANDLE hDummy = CreateFileA(
-            pipeName.c_str(),
-            GENERIC_READ | GENERIC_WRITE,
-            0,
-            NULL,
-            OPEN_EXISTING,
-            FILE_FLAG_WRITE_THROUGH,
-            NULL
-        );
-
-        if (hDummy != INVALID_HANDLE_VALUE) {
-            CloseHandle(hDummy);
-        }
-
-        // Join the server thread
+        // Join the server thread (it will clean up its own pipe handles)
         if (serverThread.joinable()) {
             LOG_INFO("Joining server thread...");
             serverThread.join();
@@ -434,7 +419,7 @@ namespace GW {
                 pipeName.c_str(),
                 PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
                 PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-                PIPE_UNLIMITED_INSTANCES,
+                MAX_PIPE_INSTANCES,
                 sizeof(PipeResponse),
                 sizeof(PipeRequest),
                 0,
@@ -460,6 +445,13 @@ namespace GW {
             // Use overlapped structure for async operations
             OVERLAPPED overlapped = {};
             overlapped.hEvent = CreateEvent(NULL, TRUE, TRUE, NULL);
+            if (!overlapped.hEvent) {
+                LOG_ERROR("Failed to create overlapped event: %lu", GetLastError());
+                CloseHandle(newPipe);
+                hPipe = INVALID_HANDLE_VALUE;
+                running = false;
+                return;
+            }
 
             // Start async connect
             BOOL connected = ConnectNamedPipe(hPipe, &overlapped);
@@ -529,6 +521,13 @@ namespace GW {
                 LOG_INFO("Stop event signaled, exiting server loop");
                 break;
             }
+        }
+
+        // Cleanup any pipe handle still owned by the server loop
+        if (hPipe != INVALID_HANDLE_VALUE) {
+            DisconnectNamedPipe(hPipe);
+            CloseHandle(hPipe);
+            hPipe = INVALID_HANDLE_VALUE;
         }
 
         LOG_INFO("Named Pipe server thread exiting");
@@ -643,6 +642,12 @@ namespace GW {
             if (bytesRead == 0) {
                 LOG_DEBUG("Zero bytes read, pipe likely closed");
                 break;
+            }
+
+            // Validate minimum request size (at least the type field must be present)
+            if (bytesRead < sizeof(request.type)) {
+                LOG_ERROR("Truncated request: only %lu bytes (need at least %zu)", bytesRead, sizeof(request.type));
+                memset(&request, 0, sizeof(request));  // Zero fill so HandleRequest rejects it cleanly
             }
 
             // Log request

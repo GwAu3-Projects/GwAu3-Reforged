@@ -26,11 +26,15 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 // ================================
 
 // Global state definition
-std::atomic<GW::DllState> GW::g_dllState{ GW::DllState::Initializing };
+std::atomic<GW::DllState> GW::g_dllState{ GW::DllState::Stopped };
 
 // Synchronization primitives
 std::condition_variable g_shutdownCV;
 std::mutex g_shutdownMutex;
+
+// Tracks whether shutdown was triggered externally (FreeLibrary / process termination)
+// vs self-initiated (UI button, WM_CLOSE). Determines ExitThread vs FreeLibraryAndExitThread.
+std::atomic<bool> g_externalShutdown{ false };
 
 // Thread management with RAII
 class ThreadRAII {
@@ -791,9 +795,21 @@ DWORD WINAPI MainThread(LPVOID param) {
     // Set final state
     GW::g_dllState = GW::DllState::Stopped;
 
-    // Exit thread and unload DLL
-    FreeLibraryAndExitThread(hModule, EXIT_SUCCESS);
-    return EXIT_SUCCESS;
+    // Choose exit strategy based on who initiated the shutdown
+    if (g_externalShutdown.load()) {
+        // External ejection (FreeLibrary called by another thread) -
+        // DLL_PROCESS_DETACH is waiting for us to exit. Just return.
+        // The external caller's FreeLibrary will unmap the DLL after we exit.
+        LOG_INFO("Exiting main thread (external shutdown)");
+        return EXIT_SUCCESS;
+    }
+    else {
+        // Self-initiated shutdown (UI button, WM_CLOSE, DLL_DETACH RPC) -
+        // We need to unload ourselves.
+        LOG_INFO("Unloading DLL (self-initiated shutdown)");
+        FreeLibraryAndExitThread(hModule, EXIT_SUCCESS);
+        return EXIT_SUCCESS; // Never reached
+    }
 }
 
 // ================================
@@ -803,11 +819,18 @@ DWORD WINAPI MainThread(LPVOID param) {
 BOOL WINAPI DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
     switch (reason) {
     case DLL_PROCESS_ATTACH: {
+        // Guard against double injection: if DLL is already running or initializing, reject
+        GW::DllState currentState = GW::g_dllState.load();
+        if (currentState == GW::DllState::Running || currentState == GW::DllState::Initializing) {
+            return FALSE; // Already loaded
+        }
+
         // Disable thread library calls for optimization
         DisableThreadLibraryCalls(hModule);
 
         // Initialize state
         GW::g_dllState = GW::DllState::Initializing;
+        g_externalShutdown = false;
 
         // Create main thread
         HANDLE hThread = CreateThread(
@@ -830,16 +853,32 @@ BOOL WINAPI DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
     }
 
     case DLL_PROCESS_DETACH: {
-        // Minimize work under loader lock - only signal shutdown.
-        // MainThread handles all cleanup (pipe server, hooks, ImGui, etc.)
+        // If the process is terminating (reserved != NULL), skip cleanup entirely.
+        // All threads are already dead, global state is inconsistent, and the OS
+        // will reclaim all resources when the process exits.
+        if (reserved != NULL) {
+            break;
+        }
+
+        // Dynamic unload (FreeLibrary called externally or by FreeLibraryAndExitThread).
+        // Mark as external shutdown so MainThread knows not to call FreeLibraryAndExitThread.
+        g_externalShutdown = true;
+
+        // Signal MainThread to begin cleanup
         GW::RequestShutdown();
         g_shutdownCV.notify_all();
 
-        // Wait for the main thread with short timeout
+        // Wait for MainThread to finish cleanup, but only if we're NOT the main thread
+        // (self-initiated shutdown via FreeLibraryAndExitThread calls DLL_PROCESS_DETACH
+        // from the same thread - waiting on self would timeout uselessly for 5 seconds).
         HANDLE hThread = g_mainThread.get();
         if (hThread) {
-            WaitForSingleObject(hThread, 5000);
-            // Thread handle will be closed by RAII destructor
+            DWORD mainThreadId = GetThreadId(hThread);
+            if (GetCurrentThreadId() != mainThreadId) {
+                // External caller - wait for MainThread to finish
+                WaitForSingleObject(hThread, 5000);
+            }
+            // If we ARE the MainThread, skip waiting (self-initiated shutdown)
         }
 
         break;
