@@ -86,10 +86,10 @@ API/
  ├─ Core/
  └─ Dll/GwNexus.dll
 Scripts/
- └─ Exemples/
+ └─ Examples/
 ```
 
-▶️ Run `Exemple - GwNexus.au3` as administrator
+▶️ Run `Example - GwNexus.au3` as administrator
 
 ---
 

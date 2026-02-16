@@ -306,22 +306,22 @@ namespace GW {
                 uint32_t server_timestamp;  // Server timestamp (GetTickCount)
                 uint32_t latency_ms;        // Calculated round-trip latency
             } heartbeat_result;
+
+            // Server status (inside union - only used for SERVER_STATUS responses)
+            struct {
+                int32_t status;
+                uint32_t client_count;
+                uint64_t uptime_ms;
+                char pipe_name[256];
+            } server_status;
+
+            // DLL status (inside union - only used for DLL_STATUS responses)
+            struct {
+                int32_t status;
+                uint32_t version;
+                char build_info[256];
+            } dll_status;
         };
-
-        // Server status
-        struct {
-            int32_t status;
-            uint32_t client_count;
-            uint64_t uptime_ms;
-            char pipe_name[256];
-        } server_status;
-
-        // DLL status
-        struct {
-            int32_t status;
-            uint32_t version;
-            char build_info[256];
-        } dll_status;
 
         char error_message[256];
     };
@@ -339,6 +339,7 @@ namespace GW {
     class NamedPipeServer {
     private:
         static NamedPipeServer* instance;
+        static std::once_flag init_flag;
 
         HANDLE hPipe;
         HANDLE hStopEvent;  // Event for signaling stop

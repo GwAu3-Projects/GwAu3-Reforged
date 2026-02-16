@@ -73,27 +73,21 @@ std::string WideToUtf8(const std::wstring& wide) {
 }
 
 std::string GetPipeName() {
-    static std::string pipeName;
-    if (pipeName.empty()) {
-        // Try to get character name first
-        std::wstring charName = GetCharacterName();
-        std::stringstream ss;
+    // Regenerate each time so character name changes are reflected
+    std::wstring charName = GetCharacterName();
+    std::stringstream ss;
 
-        if (!charName.empty()) {
-            // Replace spaces with underscores in character name
-            for (auto& c : charName) {
-                if (c == L' ') c = L'_';
-            }
-            ss << "\\\\.\\pipe\\GwNexus_" << WideToUtf8(charName);
-            LOG_INFO("Pipe name set to character: %s", WideToUtf8(charName).c_str());
-        } else {
-            // Fallback to PID if character name not found
-            ss << "\\\\.\\pipe\\GwNexus_" << GetCurrentProcessId();
-            LOG_WARN("Using PID for pipe name (character not found)");
+    if (!charName.empty()) {
+        // Replace spaces with underscores in character name
+        for (auto& c : charName) {
+            if (c == L' ') c = L'_';
         }
-        pipeName = ss.str();
+        ss << "\\\\.\\pipe\\GwNexus_" << WideToUtf8(charName);
+    } else {
+        // Fallback to PID if character name not found
+        ss << "\\\\.\\pipe\\GwNexus_" << GetCurrentProcessId();
     }
-    return pipeName;
+    return ss.str();
 }
 
 namespace GW {
@@ -146,37 +140,25 @@ namespace GW {
     }
 
     // Helper function to format a pattern for logging
-    static std::string FormatPattern(const uint8_t* pattern, size_t maxLen = 256) {
+    // patternLen = actual length (from pattern_length field), avoids null-byte truncation
+    static std::string FormatPattern(const uint8_t* pattern, size_t patternLen) {
         std::stringstream ss;
-        size_t len = 0;
-
-        // Find actual length
-        for (size_t i = 0; i < maxLen; i++) {
-            if (pattern[i] != 0) {
-                len = i + 1;
-            }
-        }
-
-        size_t displayLen = (len > 32) ? 32 : len;
+        size_t displayLen = (patternLen > 32) ? 32 : patternLen;
 
         for (size_t i = 0; i < displayLen; i++) {
-            unsigned char c = pattern[i];
-            if (c >= 32 && c <= 126) {
-                ss << (char)c;
-            }
-            else {
-                ss << "\\x" << std::hex << std::setw(2) << std::setfill('0') << (unsigned int)c;
-            }
+            ss << std::hex << std::setw(2) << std::setfill('0') << (unsigned int)pattern[i];
+            if (i + 1 < displayLen) ss << " ";
         }
 
-        if (len > 32) {
-            ss << "... (" << std::dec << len << " bytes)";
+        if (patternLen > 32) {
+            ss << "... (" << std::dec << patternLen << " bytes)";
         }
 
         return ss.str();
     }
 
     NamedPipeServer* NamedPipeServer::instance = nullptr;
+    std::once_flag NamedPipeServer::init_flag;
 
     NamedPipeServer::NamedPipeServer()
         : hPipe(INVALID_HANDLE_VALUE)
@@ -205,10 +187,10 @@ namespace GW {
     }
 
     NamedPipeServer& NamedPipeServer::GetInstance() {
-        if (!instance) {
+        std::call_once(init_flag, []() {
             LOG_DEBUG("Creating NamedPipeServer singleton instance");
             instance = new NamedPipeServer();
-        }
+        });
         return *instance;
     }
 
@@ -267,17 +249,10 @@ namespace GW {
 
         LOG_INFO("Starting Named Pipe server on: %s", actualPipeName.c_str());
 
-        // Start server thread - detach to not block
+        // Start server thread (joinable - will be joined in Stop())
         try {
             serverThread = std::thread(&NamedPipeServer::ServerLoop, this);
-            if (serverThread.joinable()) {
-                LOG_INFO("Server thread created successfully, detaching...");
-                serverThread.detach();
-            } else {
-                LOG_ERROR("Server thread is not joinable after creation!");
-                running = false;
-                return false;
-            }
+            LOG_INFO("Server thread created successfully (joinable)");
         }
         catch (const std::exception& e) {
             LOG_ERROR("Failed to create server thread: %s", e.what());
@@ -345,6 +320,13 @@ namespace GW {
             CloseHandle(hDummy);
         }
 
+        // Join the server thread
+        if (serverThread.joinable()) {
+            LOG_INFO("Joining server thread...");
+            serverThread.join();
+            LOG_INFO("Server thread joined");
+        }
+
         // Wait for all client threads to finish
         LOG_INFO("Waiting for %zu client threads to finish...", clientThreads.size());
         {
@@ -357,9 +339,6 @@ namespace GW {
             clientThreads.clear();
         }
 
-        // Wait a short time for thread to exit
-        Sleep(100);
-
         // Clear callbacks
         OnLog = nullptr;
         OnError = nullptr;
@@ -370,10 +349,22 @@ namespace GW {
     }
 
     void NamedPipeServer::CleanupFinishedThreads() {
-        // This is called periodically to remove finished threads from the vector
-        // Note: We can't easily check if threads are done, so we just keep them
-        // until Stop() is called. For a more sophisticated approach, we'd need
-        // a thread-safe way to track finished threads.
+        std::lock_guard<std::mutex> lock(clientThreadsMutex);
+        // Join and remove threads that have finished
+        auto it = clientThreads.begin();
+        while (it != clientThreads.end()) {
+            if (it->joinable()) {
+                // Try a non-blocking check: use native handle to check thread status
+                HANDLE hThread = it->native_handle();
+                DWORD result = WaitForSingleObject(hThread, 0);
+                if (result == WAIT_OBJECT_0) {
+                    it->join();
+                    it = clientThreads.erase(it);
+                    continue;
+                }
+            }
+            ++it;
+        }
     }
 
     void NamedPipeServer::ProcessClientThreaded(HANDLE clientPipe, uint32_t clientId) {
@@ -420,22 +411,10 @@ namespace GW {
         // Set thread priority
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 
-        // Security descriptor
-        SECURITY_DESCRIPTOR sd;
-        if (!InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION)) {
-            LOG_ERROR("Failed to initialize security descriptor: %lu", GetLastError());
-            running = false;
-            return;
-        }
-        if (!SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE)) {
-            LOG_ERROR("Failed to set security descriptor DACL: %lu", GetLastError());
-            running = false;
-            return;
-        }
-
+        // Security descriptor - restrict access to current user only
         SECURITY_ATTRIBUTES sa;
         sa.nLength = sizeof(SECURITY_ATTRIBUTES);
-        sa.lpSecurityDescriptor = &sd;
+        sa.lpSecurityDescriptor = nullptr;  // Default DACL: only current user + admins
         sa.bInheritHandle = FALSE;
 
         int connectionCount = 0;
@@ -523,6 +502,9 @@ namespace GW {
                 HANDLE clientPipe = hPipe;
                 hPipe = INVALID_HANDLE_VALUE;  // Clear so we don't close it
                 uint32_t clientId = connectionCount;
+
+                // Cleanup finished threads before creating new ones
+                CleanupFinishedThreads();
 
                 // Create a new thread for this client
                 {
@@ -827,6 +809,46 @@ namespace GW {
         LOG_DEBUG("ProcessClient ended after %d requests", requestCount);
     }
 
+    // SEH helper: safe memory read (must be in a separate function from C++ try/catch)
+    static bool SafeReadMemory(void* dest, const void* src, size_t size) {
+        __try {
+            memcpy(dest, src, size);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+    }
+
+    // SEH helper: safe pointer chain walk (must be in a separate function from C++ try/catch)
+    static bool SafeReadPointerChain(
+        uintptr_t baseAddress, const int32_t* offsets, uint8_t offsetCount,
+        uint8_t finalSize, uintptr_t& outFinalAddress, uint64_t& outValue)
+    {
+        __try {
+            uintptr_t currentAddress = baseAddress;
+            for (uint8_t i = 0; i < offsetCount; i++) {
+                uintptr_t nextAddress = *(uintptr_t*)currentAddress;
+                currentAddress = nextAddress + offsets[i];
+            }
+
+            outFinalAddress = currentAddress;
+            outValue = 0;
+
+            switch (finalSize) {
+            case 1: outValue = *(uint8_t*)currentAddress; break;
+            case 2: outValue = *(uint16_t*)currentAddress; break;
+            case 4: outValue = *(uint32_t*)currentAddress; break;
+            case 8: outValue = *(uint64_t*)currentAddress; break;
+            }
+
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+    }
+
     void NamedPipeServer::HandleRequest(const PipeRequest& request, PipeResponse& response) {
         LOG_TRACE("HandleRequest called for type: %s", GetRequestTypeName(request.type));
 
@@ -1008,9 +1030,8 @@ namespace GW {
                 if (request.memory.address && request.memory.size > 0
                     && request.memory.size <= sizeof(response.memory_result.data)) {
 
-                    if (!IsBadReadPtr((void*)request.memory.address, request.memory.size)) {
-                        memcpy(response.memory_result.data,
-                            (void*)request.memory.address, request.memory.size);
+                    if (SafeReadMemory(response.memory_result.data,
+                            (void*)request.memory.address, request.memory.size)) {
                         response.memory_result.address = request.memory.address;
                         response.memory_result.size = request.memory.size;
                         response.success = 1;
@@ -1079,63 +1100,29 @@ namespace GW {
                     break;
                 }
 
-                // Follow the pointer chain
-                uintptr_t currentAddress = request.pointer_chain.base_address;
+                // Follow the pointer chain using SEH helper
+                uintptr_t finalAddress = 0;
+                uint64_t finalValue = 0;
 
-                for (uint8_t i = 0; i < request.pointer_chain.offset_count; i++) {
-                    // Read pointer at current address
-                    if (IsBadReadPtr((void*)currentAddress, sizeof(uintptr_t))) {
-                        response.success = 0;
-                        sprintf_s(response.error_message, "Invalid pointer at step %d (0x%08X)",
-                            i, currentAddress);
-                        LOG_ERROR("Invalid pointer at step %d: 0x%08X", i, currentAddress);
-                        break;
-                    }
+                if (SafeReadPointerChain(
+                        request.pointer_chain.base_address,
+                        request.pointer_chain.offsets,
+                        request.pointer_chain.offset_count,
+                        request.pointer_chain.final_size,
+                        finalAddress, finalValue)) {
 
-                    // Dereference the pointer
-                    uintptr_t nextAddress = *(uintptr_t*)currentAddress;
-                    LOG_TRACE("Step %d: [0x%08X] -> 0x%08X", i, currentAddress, nextAddress);
-
-                    // Apply offset
-                    currentAddress = nextAddress + request.pointer_chain.offsets[i];
-                    LOG_TRACE("Step %d: + offset 0x%X = 0x%08X", i, request.pointer_chain.offsets[i], currentAddress);
+                    response.pointer_chain_result.final_address = finalAddress;
+                    response.pointer_chain_result.value = finalValue;
+                    response.success = 1;
+                    LOG_SUCCESS("Pointer chain resolved: final=0x%08X, value=0x%llX",
+                        finalAddress, finalValue);
                 }
-
-                // Check if we had an error during chain traversal
-                if (!response.success && strlen(response.error_message) > 0) {
-                    break;
-                }
-
-                // Read final value
-                if (IsBadReadPtr((void*)currentAddress, request.pointer_chain.final_size)) {
+                else {
                     response.success = 0;
-                    sprintf_s(response.error_message, "Invalid final address: 0x%08X", currentAddress);
-                    LOG_ERROR("Invalid final address: 0x%08X", currentAddress);
-                    break;
+                    strcpy_s(response.error_message, "Invalid pointer in chain");
+                    LOG_ERROR("Access violation in pointer chain from 0x%08X",
+                        request.pointer_chain.base_address);
                 }
-
-                response.pointer_chain_result.final_address = currentAddress;
-                response.pointer_chain_result.value = 0;
-
-                // Read value based on size
-                switch (request.pointer_chain.final_size) {
-                case 1:
-                    response.pointer_chain_result.value = *(uint8_t*)currentAddress;
-                    break;
-                case 2:
-                    response.pointer_chain_result.value = *(uint16_t*)currentAddress;
-                    break;
-                case 4:
-                    response.pointer_chain_result.value = *(uint32_t*)currentAddress;
-                    break;
-                case 8:
-                    response.pointer_chain_result.value = *(uint64_t*)currentAddress;
-                    break;
-                }
-
-                response.success = 1;
-                LOG_SUCCESS("Pointer chain resolved: final=0x%08X, value=0x%llX",
-                    currentAddress, response.pointer_chain_result.value);
                 break;
             }
 

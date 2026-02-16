@@ -68,8 +68,9 @@ Global Enum _
 
 ; Structure sizes (packed, 1-byte alignment)
 Global Const $SIZE_FUNCTION_PARAM = 260        ; 1 + 3 padding + 256 union (string_val[256])
-Global Const $SIZE_PIPE_REQUEST = 2644         ; Max size of request
-Global Const $SIZE_PIPE_RESPONSE = 2576        ; Max size of response
+Global Const $SIZE_PIPE_REQUEST = 2672         ; 4 (type) + 2668 (call_func = 64+1+3+10*260)
+Global Const $SIZE_PIPE_RESPONSE = 2324        ; 4 (success+pad) + 2064 (union: array_result) + 256 (error_message)
+; Union size = 2064 bytes (array_result is largest: 1+3+4+4+4+2048)
 
 ; ============================================================================
 ; Structure Creation Functions
@@ -493,12 +494,12 @@ Func _GwNexus_ParseFunctionListResponse($tResponse)
 EndFunc
 
 ; Get error message from response
+; error_message is at offset 4 (header) + 2064 (union) = 2068
 Func _GwNexus_GetErrorMessage($tResponse)
-    ; Error message is at offset after the union (approximately)
     Local $tError = DllStructCreate( _
         "byte success;" & _
         "byte padding[3];" & _
-        "byte skip[1036];" & _  ; Skip union data
+        "byte skip[2064];" & _  ; Skip union data (array_result = 2064 bytes)
         "char error[256]" _
     )
 

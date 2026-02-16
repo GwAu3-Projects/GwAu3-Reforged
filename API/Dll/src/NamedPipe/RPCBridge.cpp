@@ -133,9 +133,11 @@ namespace GW {
     }
 
     bool RPCBridge::HandleScannerRequest(const PipeRequest& request, PipeResponse& response) {
-        // Scanner requests are handled by NamedPipeServer for backward compatibility
+        // Scanner requests (types 1-8) are handled directly by NamedPipeServer::HandleRequest()
+        // before reaching RPCBridge. This should never be called.
+        LOG_WARN("HandleScannerRequest called unexpectedly for type %d - routing error", request.type);
         response.success = 0;
-        strcpy_s(response.error_message, "Scanner requests should be handled by NamedPipeServer");
+        strcpy_s(response.error_message, "Internal routing error: scanner request reached RPCBridge");
         return false;
     }
 
@@ -945,8 +947,14 @@ namespace GW {
             }
         }
 
-        // Validate this pointer
-        if (!args[0] || IsBadReadPtr((void*)args[0], sizeof(void*))) {
+        // Validate this pointer using VirtualQuery
+        if (!args[0]) {
+            LOG_ERROR("Invalid this pointer: null");
+            return false;
+        }
+        MEMORY_BASIC_INFORMATION mbi_this;
+        if (VirtualQuery((LPCVOID)args[0], &mbi_this, sizeof(mbi_this)) == 0 ||
+            mbi_this.State != MEM_COMMIT) {
             LOG_ERROR("Invalid this pointer: 0x%X", args[0]);
             return false;
         }
@@ -1048,12 +1056,6 @@ namespace GW {
         // Validate parameters
         if (!address || !data || size == 0 || size > MAX_WRITE_SIZE) {
             LOG_ERROR("Invalid write parameters: addr=0x%X, size=%zu", address, size);
-            return false;
-        }
-
-        // Check if address is writable
-        if (IsBadWritePtr((LPVOID)address, size)) {
-            LOG_ERROR("Address 0x%X is not writable for size %zu", address, size);
             return false;
         }
 
@@ -1225,9 +1227,11 @@ namespace GW {
             return false;
         }
 
-        // Validate buffer is writable
-        if (IsBadWritePtr((LPVOID)buffer, size)) {
-            LOG_ERROR("Event buffer at 0x%X is not writable", buffer);
+        // Validate buffer address
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery((LPCVOID)buffer, &mbi, sizeof(mbi)) == 0 ||
+            mbi.State != MEM_COMMIT) {
+            LOG_ERROR("Event buffer at 0x%X is not valid", buffer);
             return false;
         }
 
@@ -1329,6 +1333,13 @@ namespace GW {
                 return true;
             }
 
+            // Check for integer overflow before multiplication
+            if (elementCount > 0 && elementSize > sizeof(response.array_result.data) / elementCount) {
+                strcpy_s(response.error_message, "Array too large (overflow)");
+                response.success = 0;
+                return true;
+            }
+
             uint32_t totalSize = elementSize * elementCount;
 
             // Check size limits (max 2048 bytes in array_result.data)
@@ -1345,20 +1356,7 @@ namespace GW {
                 return true;
             }
 
-            MEMORY_BASIC_INFORMATION mbi;
-            if (VirtualQuery((LPCVOID)address, &mbi, sizeof(mbi)) == 0) {
-                strcpy_s(response.error_message, "Invalid memory address");
-                response.success = 0;
-                return true;
-            }
-
-            if (!(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))) {
-                strcpy_s(response.error_message, "Memory not readable");
-                response.success = 0;
-                return true;
-            }
-
-            // Read the array data
+            // Read the array data with SEH protection
             __try {
                 memcpy(response.array_result.data, (void*)address, totalSize);
             }

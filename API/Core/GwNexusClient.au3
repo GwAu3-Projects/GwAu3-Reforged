@@ -32,8 +32,9 @@ Global $g_sGwNexusPipeName = ""
 ; Current active connection (for legacy single-connection API)
 Global $g_aGwNexusActiveConnection = 0
 
-; Response buffer size
-Global Const $GWNEXUS_RESPONSE_SIZE = 2860
+; Response buffer size (must match sizeof(PipeResponse) in C++)
+; = 4 (success+pad) + 2064 (union) + 256 (error_message) = 2324
+Global Const $GWNEXUS_RESPONSE_SIZE = 2324
 
 ; ============================================================================
 ; Client-Side Cache (Performance Optimization)
@@ -81,14 +82,14 @@ Func _GwNexus_CreateConnection($iPID)
         ConsoleWrite("[DEBUG] WaitNamedPipe failed for PID " & $iPID & ", error: " & _WinAPI_GetLastError() & @CRLF)
     EndIf
 
-    ; Try to connect to the pipe
+    ; Try to connect to the pipe (with FILE_FLAG_OVERLAPPED for timeout support)
     Local $aResult = DllCall("kernel32.dll", "handle", "CreateFileW", _
         "wstr", $sPipeName, _
         "dword", BitOR(0x80000000, 0x40000000), _ ; GENERIC_READ | GENERIC_WRITE
         "dword", 0, _                              ; No sharing
         "ptr", 0, _                                ; Default security
         "dword", 3, _                              ; OPEN_EXISTING
-        "dword", 0, _                              ; Normal attributes
+        "dword", 0x40000000, _                     ; FILE_FLAG_OVERLAPPED
         "ptr", 0)                                  ; No template
 
     If @error Then
@@ -390,45 +391,15 @@ EndFunc
 ; Low-Level Communication
 ; ============================================================================
 
-; Send request and receive response
+; Send request and receive response (delegates to active connection with timeout)
 ; $tRequest = DllStruct of request
 ; Returns: DllStruct of response or 0 on error
 Func _GwNexus_SendRequest($tRequest)
-    If $g_hGwNexusPipe = -1 Then
+    If Not IsArray($g_aGwNexusActiveConnection) Or Not _GwNexus_IsConnectionValid($g_aGwNexusActiveConnection) Then
         Return SetError(1, 0, 0) ; Not connected
     EndIf
 
-    Local $iRequestSize = DllStructGetSize($tRequest)
-    Local $iBytesWritten = 0
-
-    ; Write request to pipe
-    Local $aResult = DllCall("kernel32.dll", "bool", "WriteFile", _
-        "handle", $g_hGwNexusPipe, _
-        "struct*", $tRequest, _
-        "dword", $iRequestSize, _
-        "dword*", $iBytesWritten, _
-        "ptr", 0)
-
-    If @error Or $aResult[0] = 0 Then
-        Return SetError(2, @error, 0) ; Write failed
-    EndIf
-
-    ; Read response
-    Local $tResponse = DllStructCreate("byte data[" & $GWNEXUS_RESPONSE_SIZE & "]")
-    Local $iBytesRead = 0
-
-    $aResult = DllCall("kernel32.dll", "bool", "ReadFile", _
-        "handle", $g_hGwNexusPipe, _
-        "struct*", $tResponse, _
-        "dword", $GWNEXUS_RESPONSE_SIZE, _
-        "dword*", $iBytesRead, _
-        "ptr", 0)
-
-    If @error Or $aResult[0] = 0 Then
-        Return SetError(3, @error, 0) ; Read failed
-    EndIf
-
-    Return $tResponse
+    Return _GwNexus_SendRequestEx($g_aGwNexusActiveConnection, $tRequest)
 EndFunc
 
 ; ============================================================================
@@ -441,84 +412,29 @@ EndFunc
 ; $iSection = Section to scan (SECTION_TEXT, SECTION_RDATA, SECTION_DATA)
 ; Returns: Address or 0 on failure
 Func _GwNexus_ScanFind($sPattern, $iOffset = 0, $iSection = $SECTION_TEXT)
-    ; Check cache first
-    If $g_bCacheEnabled Then
-        Local $sCacheKey = "SF:" & $sPattern & ":" & $iOffset & ":" & $iSection
-        If $g_dicScanCache.Exists($sCacheKey) Then
-            Return $g_dicScanCache.Item($sCacheKey)
-        EndIf
+    If Not IsArray($g_aGwNexusActiveConnection) Or Not _GwNexus_IsConnectionValid($g_aGwNexusActiveConnection) Then
+        Return SetError(1, 0, 0)
     EndIf
-
-    Local $sMask = _GwNexus_CreateMaskFromPattern($sPattern)
-    Local $tRequest = _GwNexus_CreateScanRequest($sPattern, $sMask, $iOffset, $iSection)
-
-    Local $tResponse = _GwNexus_SendRequest($tRequest)
-    If @error Then Return SetError(@error, 0, 0)
-
-    Local $iResult = _GwNexus_ParseScanResponse($tResponse)
-
-    ; Cache the result
-    If $g_bCacheEnabled And $iResult <> 0 Then
-        Local $sCacheKey = "SF:" & $sPattern & ":" & $iOffset & ":" & $iSection
-        $g_dicScanCache.Add($sCacheKey, $iResult)
-    EndIf
-
-    Return $iResult
+    Return _GwNexus_ScanFindEx($g_aGwNexusActiveConnection, $sPattern, $iOffset, $iSection)
 EndFunc
 
 ; Find pattern using assertion message
 ; Returns: Address or 0 on failure
 Func _GwNexus_ScanFindAssertion($sFile, $sMessage, $iLine = 0, $iOffset = 0)
-    ; Check cache first
-    If $g_bCacheEnabled Then
-        Local $sCacheKey = "SA:" & $sFile & ":" & $sMessage & ":" & $iLine & ":" & $iOffset
-        If $g_dicScanCache.Exists($sCacheKey) Then
-            Return $g_dicScanCache.Item($sCacheKey)
-        EndIf
+    If Not IsArray($g_aGwNexusActiveConnection) Or Not _GwNexus_IsConnectionValid($g_aGwNexusActiveConnection) Then
+        Return SetError(1, 0, 0)
     EndIf
-
-    Local $tRequest = _GwNexus_CreateAssertionRequest($sFile, $sMessage, $iLine, $iOffset)
-
-    Local $tResponse = _GwNexus_SendRequest($tRequest)
-    If @error Then Return SetError(@error, 0, 0)
-
-    Local $iResult = _GwNexus_ParseScanResponse($tResponse)
-
-    ; Cache the result
-    If $g_bCacheEnabled And $iResult <> 0 Then
-        Local $sCacheKey = "SA:" & $sFile & ":" & $sMessage & ":" & $iLine & ":" & $iOffset
-        $g_dicScanCache.Add($sCacheKey, $iResult)
-    EndIf
-
-    Return $iResult
+    Return _GwNexus_ScanFindAssertionEx($g_aGwNexusActiveConnection, $sFile, $sMessage, $iLine, $iOffset)
 EndFunc
 
 ; Get function address from a near call instruction
 ; $iAddress = Address of the CALL instruction (E8 xx xx xx xx)
 ; Returns: Target function address or 0 on failure
 Func _GwNexus_ScanFunctionFromNearCall($iAddress)
-    ; Check cache first
-    If $g_bCacheEnabled Then
-        Local $sCacheKey = "NC:" & Hex($iAddress)
-        If $g_dicScanCache.Exists($sCacheKey) Then
-            Return $g_dicScanCache.Item($sCacheKey)
-        EndIf
+    If Not IsArray($g_aGwNexusActiveConnection) Or Not _GwNexus_IsConnectionValid($g_aGwNexusActiveConnection) Then
+        Return SetError(1, 0, 0)
     EndIf
-
-    Local $tRequest = _GwNexus_CreateFunctionFromNearCallRequest($iAddress)
-
-    Local $tResponse = _GwNexus_SendRequest($tRequest)
-    If @error Then Return SetError(@error, 0, 0)
-
-    Local $iResult = _GwNexus_ParseScanResponse($tResponse)
-
-    ; Cache the result
-    If $g_bCacheEnabled And $iResult <> 0 Then
-        Local $sCacheKey = "NC:" & Hex($iAddress)
-        $g_dicScanCache.Add($sCacheKey, $iResult)
-    EndIf
-
-    Return $iResult
+    Return _GwNexus_ScanFunctionFromNearCallEx($g_aGwNexusActiveConnection, $iAddress)
 EndFunc
 
 ; ============================================================================
@@ -528,47 +444,37 @@ EndFunc
 ; Register a function for calling
 ; Returns: True on success, False on failure
 Func _GwNexus_RegisterFunction($sName, $iAddress, $iParamCount, $iConvention = $CONV_STDCALL, $bHasReturn = True)
-    Local $tRequest = _GwNexus_CreateRegisterFunctionRequest($sName, $iAddress, $iParamCount, $iConvention, $bHasReturn)
-
-    Local $tResponse = _GwNexus_SendRequest($tRequest)
-    If @error Then Return SetError(@error, 0, False)
-
-    Local $tResult = DllStructCreate("byte success", DllStructGetPtr($tResponse))
-    Return DllStructGetData($tResult, "success") = 1
+    If Not IsArray($g_aGwNexusActiveConnection) Or Not _GwNexus_IsConnectionValid($g_aGwNexusActiveConnection) Then
+        Return SetError(1, 0, False)
+    EndIf
+    Return _GwNexus_RegisterFunctionEx($g_aGwNexusActiveConnection, $sName, $iAddress, $iParamCount, $iConvention, $bHasReturn)
 EndFunc
 
 ; Unregister a function
 Func _GwNexus_UnregisterFunction($sName)
-    Local $tRequest = _GwNexus_CreateUnregisterFunctionRequest($sName)
-
-    Local $tResponse = _GwNexus_SendRequest($tRequest)
-    If @error Then Return SetError(@error, 0, False)
-
-    Local $tResult = DllStructCreate("byte success", DllStructGetPtr($tResponse))
-    Return DllStructGetData($tResult, "success") = 1
+    If Not IsArray($g_aGwNexusActiveConnection) Or Not _GwNexus_IsConnectionValid($g_aGwNexusActiveConnection) Then
+        Return SetError(1, 0, False)
+    EndIf
+    Return _GwNexus_UnregisterFunctionEx($g_aGwNexusActiveConnection, $sName)
 EndFunc
 
 ; Call a registered function
 ; $aParams = 2D array [[type, value], [type, value], ...]
 ; Returns: Return value or 0
 Func _GwNexus_CallFunction($sName, $aParams = Null)
-    Local $tRequest = _GwNexus_CreateCallFunctionRequest($sName, $aParams)
-
-    Local $tResponse = _GwNexus_SendRequest($tRequest)
-    If @error Then Return SetError(@error, 0, 0)
-
-    Return _GwNexus_ParseCallResponse($tResponse)
+    If Not IsArray($g_aGwNexusActiveConnection) Or Not _GwNexus_IsConnectionValid($g_aGwNexusActiveConnection) Then
+        Return SetError(1, 0, 0)
+    EndIf
+    Return _GwNexus_CallFunctionEx($g_aGwNexusActiveConnection, $sName, $aParams)
 EndFunc
 
 ; List registered functions
 ; Returns: Array of function names
 Func _GwNexus_ListFunctions()
-    Local $tRequest = _GwNexus_CreateListFunctionsRequest()
-
-    Local $tResponse = _GwNexus_SendRequest($tRequest)
-    If @error Then Return SetError(@error, 0, 0)
-
-    Return _GwNexus_ParseFunctionListResponse($tResponse)
+    If Not IsArray($g_aGwNexusActiveConnection) Or Not _GwNexus_IsConnectionValid($g_aGwNexusActiveConnection) Then
+        Return SetError(1, 0, 0)
+    EndIf
+    Return _GwNexus_ListFunctionsEx($g_aGwNexusActiveConnection)
 EndFunc
 
 ; ============================================================================
@@ -578,59 +484,35 @@ EndFunc
 ; Read memory from target process
 ; Returns: Array [address, size, data struct] or 0 on failure
 Func _GwNexus_ReadMemory($iAddress, $iSize)
-    If $iSize > 1024 Then $iSize = 1024 ; Max size
-
-    Local $tRequest = _GwNexus_CreateReadMemoryRequest($iAddress, $iSize)
-
-    Local $tResponse = _GwNexus_SendRequest($tRequest)
-    If @error Then Return SetError(@error, 0, 0)
-
-    Return _GwNexus_ParseMemoryResponse($tResponse)
+    If Not IsArray($g_aGwNexusActiveConnection) Or Not _GwNexus_IsConnectionValid($g_aGwNexusActiveConnection) Then
+        Return SetError(1, 0, 0)
+    EndIf
+    Return _GwNexus_ReadMemoryEx($g_aGwNexusActiveConnection, $iAddress, $iSize)
 EndFunc
 
 ; Read a single value from memory
 Func _GwNexus_ReadMemoryValue($iAddress, $sType = "dword")
-    Local $iSize
-    Switch $sType
-        Case "byte"
-            $iSize = 1
-        Case "word", "short"
-            $iSize = 2
-        Case "dword", "int", "float"
-            $iSize = 4
-        Case "int64", "double", "ptr"
-            $iSize = 8
-        Case Else
-            $iSize = 4
-    EndSwitch
-
-    Local $aResult = _GwNexus_ReadMemory($iAddress, $iSize)
-    If @error Then Return SetError(@error, 0, 0)
-
-    Local $tValue = DllStructCreate($sType, DllStructGetPtr($aResult[2]))
-    Return DllStructGetData($tValue, 1)
+    If Not IsArray($g_aGwNexusActiveConnection) Or Not _GwNexus_IsConnectionValid($g_aGwNexusActiveConnection) Then
+        Return SetError(1, 0, 0)
+    EndIf
+    Return _GwNexus_ReadMemoryValueEx($g_aGwNexusActiveConnection, $iAddress, $sType)
 EndFunc
 
 ; Write memory to target process
 ; Returns: True on success
 Func _GwNexus_WriteMemory($iAddress, $tData, $iSize)
-    If $iSize > 1024 Then Return SetError(1, 0, False) ; Too large
-
-    Local $tRequest = _GwNexus_CreateWriteMemoryRequest($iAddress, $tData, $iSize)
-
-    Local $tResponse = _GwNexus_SendRequest($tRequest)
-    If @error Then Return SetError(@error, 0, False)
-
-    Local $tResult = DllStructCreate("byte success", DllStructGetPtr($tResponse))
-    Return DllStructGetData($tResult, "success") = 1
+    If Not IsArray($g_aGwNexusActiveConnection) Or Not _GwNexus_IsConnectionValid($g_aGwNexusActiveConnection) Then
+        Return SetError(1, 0, False)
+    EndIf
+    Return _GwNexus_WriteMemoryEx($g_aGwNexusActiveConnection, $iAddress, $tData, $iSize)
 EndFunc
 
 ; Write a single value to memory
 Func _GwNexus_WriteMemoryValue($iAddress, $vValue, $sType = "dword")
-    Local $tData = DllStructCreate($sType)
-    DllStructSetData($tData, 1, $vValue)
-
-    Return _GwNexus_WriteMemory($iAddress, $tData, DllStructGetSize($tData))
+    If Not IsArray($g_aGwNexusActiveConnection) Or Not _GwNexus_IsConnectionValid($g_aGwNexusActiveConnection) Then
+        Return SetError(1, 0, False)
+    EndIf
+    Return _GwNexus_WriteMemoryValueEx($g_aGwNexusActiveConnection, $iAddress, $vValue, $sType)
 EndFunc
 
 ; Read value following a pointer chain
@@ -639,64 +521,27 @@ EndFunc
 ; $iFinalSize = Size of final value to read (1, 2, 4, or 8 bytes)
 ; Returns: Value read at the end of the chain, or 0 on error
 Func _GwNexus_ReadPointerChain($iBaseAddress, $aOffsets, $iFinalSize = 4)
-    Local $tRequest = _GwNexus_CreatePointerChainRequest($iBaseAddress, $aOffsets, $iFinalSize)
-
-    Local $tResponse = _GwNexus_SendRequest($tRequest)
-    If @error Then Return SetError(@error, 0, 0)
-
-    ; Parse response
-    ; PipeResponse: success (1) + padding (3) + union (pointer_chain_result at same offset as others)
-    Local $tResult = DllStructCreate( _
-        "byte success;" & _
-        "byte padding[3];" & _
-        "ptr final_address;" & _
-        "uint64 value", _
-        DllStructGetPtr($tResponse))
-
-    If DllStructGetData($tResult, "success") = 0 Then
+    If Not IsArray($g_aGwNexusActiveConnection) Or Not _GwNexus_IsConnectionValid($g_aGwNexusActiveConnection) Then
         Return SetError(1, 0, 0)
     EndIf
-
-    ; Return value based on final_size
-    Local $iValue = DllStructGetData($tResult, "value")
-
-    Switch $iFinalSize
-        Case 1
-            Return BitAND($iValue, 0xFF)
-        Case 2
-            Return BitAND($iValue, 0xFFFF)
-        Case 4
-            Return BitAND($iValue, 0xFFFFFFFF)
-        Case 8
-            Return $iValue
-        Case Else
-            Return BitAND($iValue, 0xFFFFFFFF)
-    EndSwitch
+    Return _GwNexus_ReadPointerChainEx($g_aGwNexusActiveConnection, $iBaseAddress, $aOffsets, $iFinalSize)
 EndFunc
 
 ; Allocate memory in target process
 ; Returns: Allocated address or 0
 Func _GwNexus_AllocateMemory($iSize, $iProtection = 0x40)
-    Local $tRequest = _GwNexus_CreateAllocateMemoryRequest($iSize, $iProtection)
-
-    Local $tResponse = _GwNexus_SendRequest($tRequest)
-    If @error Then Return SetError(@error, 0, 0)
-
-    Local $aResult = _GwNexus_ParseMemoryResponse($tResponse)
-    If @error Then Return SetError(@error, 0, 0)
-
-    Return $aResult[0]
+    If Not IsArray($g_aGwNexusActiveConnection) Or Not _GwNexus_IsConnectionValid($g_aGwNexusActiveConnection) Then
+        Return SetError(1, 0, 0)
+    EndIf
+    Return _GwNexus_AllocateMemoryEx($g_aGwNexusActiveConnection, $iSize, $iProtection)
 EndFunc
 
 ; Free memory in target process
 Func _GwNexus_FreeMemory($iAddress)
-    Local $tRequest = _GwNexus_CreateFreeMemoryRequest($iAddress)
-
-    Local $tResponse = _GwNexus_SendRequest($tRequest)
-    If @error Then Return SetError(@error, 0, False)
-
-    Local $tResult = DllStructCreate("byte success", DllStructGetPtr($tResponse))
-    Return DllStructGetData($tResult, "success") = 1
+    If Not IsArray($g_aGwNexusActiveConnection) Or Not _GwNexus_IsConnectionValid($g_aGwNexusActiveConnection) Then
+        Return SetError(1, 0, False)
+    EndIf
+    Return _GwNexus_FreeMemoryEx($g_aGwNexusActiveConnection, $iAddress)
 EndFunc
 
 ; ============================================================================
@@ -709,77 +554,10 @@ EndFunc
 ; $iElementCount = Number of elements to read
 ; Returns: AutoIt array of values, or 0 on error
 Func _GwNexus_ReadMemoryArray($iAddress, $iElementType, $iElementCount)
-    ; Create request
-    Local $tRequest = DllStructCreate( _
-        "int type;" & _
-        "ptr address;" & _
-        "byte element_type;" & _
-        "byte padding[3];" & _
-        "uint element_count" _
-    )
-
-    DllStructSetData($tRequest, "type", $REQUEST_READ_MEMORY_ARRAY)
-    DllStructSetData($tRequest, "address", $iAddress)
-    DllStructSetData($tRequest, "element_type", $iElementType)
-    DllStructSetData($tRequest, "element_count", $iElementCount)
-
-    ; Send request
-    Local $tResponse = _GwNexus_SendRequest($tRequest)
-    If @error Then Return SetError(@error, 0, 0)
-
-    ; Parse response header
-    Local $tHeader = DllStructCreate( _
-        "byte success;" & _
-        "byte padding[3];" & _
-        "byte element_type;" & _
-        "byte padding2[3];" & _
-        "uint element_count;" & _
-        "uint element_size;" & _
-        "uint total_size", _
-        DllStructGetPtr($tResponse))
-
-    If DllStructGetData($tHeader, "success") = 0 Then
+    If Not IsArray($g_aGwNexusActiveConnection) Or Not _GwNexus_IsConnectionValid($g_aGwNexusActiveConnection) Then
         Return SetError(1, 0, 0)
     EndIf
-
-    Local $iCount = DllStructGetData($tHeader, "element_count")
-    Local $iElemSize = DllStructGetData($tHeader, "element_size")
-    Local $iType = DllStructGetData($tHeader, "element_type")
-
-    ; Create result array
-    Local $aResult[$iCount]
-
-    ; Get pointer to data (after header: 1 + 3 + 1 + 3 + 4 + 4 + 4 = 20 bytes)
-    Local $pData = DllStructGetPtr($tResponse) + 20
-
-    ; Parse elements based on type
-    Local $sStructType = ""
-    Switch $iType
-        Case $PARAM_INT8
-            $sStructType = "byte"
-        Case $PARAM_INT16
-            $sStructType = "short"
-        Case $PARAM_INT32
-            $sStructType = "int"
-        Case $PARAM_INT64
-            $sStructType = "int64"
-        Case $PARAM_FLOAT
-            $sStructType = "float"
-        Case $PARAM_DOUBLE
-            $sStructType = "double"
-        Case $PARAM_POINTER
-            $sStructType = "ptr"
-        Case Else
-            Return SetError(2, 0, 0) ; Unknown type
-    EndSwitch
-
-    ; Read each element
-    For $i = 0 To $iCount - 1
-        Local $tElement = DllStructCreate($sStructType, $pData + ($i * $iElemSize))
-        $aResult[$i] = DllStructGetData($tElement, 1)
-    Next
-
-    Return $aResult
+    Return _GwNexus_ReadMemoryArrayEx($g_aGwNexusActiveConnection, $iAddress, $iElementType, $iElementCount)
 EndFunc
 
 ; Read an array of typed values from memory (Extended - specific connection)
@@ -901,91 +679,10 @@ EndFunc
 Global $g_aLastBatchSuccessMask[4] ; Store success mask from last batch read
 
 Func _GwNexus_BatchReadMemory($aAddresses, $vSizes = 4)
-    Local $iCount = UBound($aAddresses)
-    If $iCount = 0 Or $iCount > 32 Then
-        Return SetError(1, 0, 0) ; Invalid count
-    EndIf
-
-    ; Create request structure
-    ; type (4) + count (1) + sizes[32] (32) + padding (3) + addresses[32] (128 for 32-bit)
-    Local $tRequest = DllStructCreate( _
-        "int type;" & _
-        "byte count;" & _
-        "byte sizes[32];" & _
-        "byte padding[3];" & _
-        "ptr addresses[32]" _
-    )
-
-    DllStructSetData($tRequest, "type", $REQUEST_BATCH_READ_MEMORY)
-    DllStructSetData($tRequest, "count", $iCount)
-
-    ; Set sizes
-    If IsArray($vSizes) Then
-        For $i = 0 To $iCount - 1
-            DllStructSetData($tRequest, "sizes", $vSizes[$i], $i + 1)
-        Next
-    Else
-        For $i = 0 To $iCount - 1
-            DllStructSetData($tRequest, "sizes", $vSizes, $i + 1)
-        Next
-    EndIf
-
-    ; Set addresses
-    For $i = 0 To $iCount - 1
-        DllStructSetData($tRequest, "addresses", $aAddresses[$i], $i + 1)
-    Next
-
-    ; Send request
-    Local $tResponse = _GwNexus_SendRequest($tRequest)
-    If @error Then Return SetError(@error, 0, 0)
-
-    ; Parse response
-    ; success (1) + padding (3) + count (1) + success_mask[4] (4) + padding (3) + values[32] (256)
-    Local $tResult = DllStructCreate( _
-        "byte success;" & _
-        "byte padding[3];" & _
-        "byte count;" & _
-        "byte success_mask[4];" & _
-        "byte padding2[3];" & _
-        "uint64 values[32]", _
-        DllStructGetPtr($tResponse))
-
-    If DllStructGetData($tResult, "success") = 0 Then
+    If Not IsArray($g_aGwNexusActiveConnection) Or Not _GwNexus_IsConnectionValid($g_aGwNexusActiveConnection) Then
         Return SetError(1, 0, 0)
     EndIf
-
-    ; Store success mask for later checking
-    For $i = 0 To 3
-        $g_aLastBatchSuccessMask[$i] = DllStructGetData($tResult, "success_mask", $i + 1)
-    Next
-
-    ; Extract values
-    Local $aResult[$iCount]
-    For $i = 0 To $iCount - 1
-        Local $iValue = DllStructGetData($tResult, "values", $i + 1)
-
-        ; Mask based on size
-        If IsArray($vSizes) Then
-            Local $iSize = $vSizes[$i]
-        Else
-            Local $iSize = $vSizes
-        EndIf
-
-        Switch $iSize
-            Case 1
-                $aResult[$i] = BitAND($iValue, 0xFF)
-            Case 2
-                $aResult[$i] = BitAND($iValue, 0xFFFF)
-            Case 4
-                $aResult[$i] = BitAND($iValue, 0xFFFFFFFF)
-            Case 8
-                $aResult[$i] = $iValue
-            Case Else
-                $aResult[$i] = BitAND($iValue, 0xFFFFFFFF)
-        EndSwitch
-    Next
-
-    Return $aResult
+    Return _GwNexus_BatchReadMemoryEx($g_aGwNexusActiveConnection, $aAddresses, $vSizes)
 EndFunc
 
 ; Check if a specific index in the last batch read succeeded
@@ -1081,87 +778,22 @@ EndFunc
 ; Server/DLL Control
 ; ============================================================================
 
-; Get server status
+; Get server status (delegates to Ex version)
 ; Returns: Array [status, client_count, uptime_ms, pipe_name] or 0 on failure
 Func _GwNexus_GetServerStatus()
-    Local $tRequest = _GwNexus_CreateServerStatusRequest()
-
-    Local $tResponse = _GwNexus_SendRequest($tRequest)
-    If @error Then Return SetError(@error, 0, 0)
-
-    ; PipeResponse layout:
-    ; - success (1) + padding (3) = 4 bytes
-    ; - union (largest = function_list: 4 + 20*64 = 1284 bytes)
-    ; - server_status starts at offset 1288
-    ; Total union size = 1284 bytes
-
-    Local $tResult = DllStructCreate( _
-        "byte success;" & _
-        "byte padding[3];" & _
-        "byte union_data[1284];" & _  ; Skip union (function_list is largest: 4 + 1280)
-        "int status;" & _
-        "uint client_count;" & _
-        "uint64 uptime_ms;" & _
-        "char pipe_name[256]" _
-    )
-
-    DllCall("kernel32.dll", "none", "RtlMoveMemory", _
-        "ptr", DllStructGetPtr($tResult), _
-        "ptr", DllStructGetPtr($tResponse), _
-        "ulong_ptr", DllStructGetSize($tResult))
-
-    If DllStructGetData($tResult, "success") = 0 Then
+    If Not IsArray($g_aGwNexusActiveConnection) Or Not _GwNexus_IsConnectionValid($g_aGwNexusActiveConnection) Then
         Return SetError(1, 0, 0)
     EndIf
-
-    Local $aStatus[4]
-    $aStatus[0] = DllStructGetData($tResult, "status")
-    $aStatus[1] = DllStructGetData($tResult, "client_count")
-    $aStatus[2] = DllStructGetData($tResult, "uptime_ms")
-    $aStatus[3] = DllStructGetData($tResult, "pipe_name")
-
-    Return $aStatus
+    Return _GwNexus_GetServerStatusEx($g_aGwNexusActiveConnection)
 EndFunc
 
-; Get DLL status
+; Get DLL status (delegates to Ex version)
 ; Returns: Array [status, version, build_info] or 0 on failure
 Func _GwNexus_GetDLLStatus()
-    Local $tRequest = _GwNexus_CreateDLLStatusRequest()
-
-    Local $tResponse = _GwNexus_SendRequest($tRequest)
-    If @error Then Return SetError(@error, 0, 0)
-
-    ; PipeResponse layout:
-    ; - success (1) + padding (3) = 4 bytes
-    ; - union = 1284 bytes
-    ; - server_status (4 + 4 + 8 + 256) = 272 bytes
-    ; - dll_status starts at offset 1560
-
-    Local $tResult = DllStructCreate( _
-        "byte success;" & _
-        "byte padding[3];" & _
-        "byte union_data[1284];" & _     ; Skip union
-        "byte server_status[272];" & _   ; Skip server_status (4+4+8+256)
-        "int status;" & _
-        "uint version;" & _
-        "char build_info[256]" _
-    )
-
-    DllCall("kernel32.dll", "none", "RtlMoveMemory", _
-        "ptr", DllStructGetPtr($tResult), _
-        "ptr", DllStructGetPtr($tResponse), _
-        "ulong_ptr", DllStructGetSize($tResult))
-
-    If DllStructGetData($tResult, "success") = 0 Then
+    If Not IsArray($g_aGwNexusActiveConnection) Or Not _GwNexus_IsConnectionValid($g_aGwNexusActiveConnection) Then
         Return SetError(1, 0, 0)
     EndIf
-
-    Local $aStatus[3]
-    $aStatus[0] = DllStructGetData($tResult, "status")
-    $aStatus[1] = DllStructGetData($tResult, "version")
-    $aStatus[2] = DllStructGetData($tResult, "build_info")
-
-    Return $aStatus
+    Return _GwNexus_GetDLLStatusEx($g_aGwNexusActiveConnection)
 EndFunc
 
 ; ============================================================================
@@ -1171,34 +803,10 @@ EndFunc
 ; Send heartbeat to check if connection is alive and measure latency
 ; Returns: Array [client_timestamp, server_timestamp, latency_ms] or 0 on failure
 Func _GwNexus_Heartbeat()
-    Local $iClientTimestamp = DllCall("kernel32.dll", "dword", "GetTickCount")[0]
-
-    Local $tRequest = DllStructCreate("int type; uint client_timestamp")
-    DllStructSetData($tRequest, "type", $REQUEST_HEARTBEAT)
-    DllStructSetData($tRequest, "client_timestamp", $iClientTimestamp)
-
-    Local $tResponse = _GwNexus_SendRequest($tRequest)
-    If @error Then Return SetError(@error, 0, 0)
-
-    ; Parse response - heartbeat_result is in the union
-    Local $tResult = DllStructCreate( _
-        "byte success;" & _
-        "byte padding[3];" & _
-        "uint client_timestamp;" & _
-        "uint server_timestamp;" & _
-        "uint latency_ms", _
-        DllStructGetPtr($tResponse))
-
-    If DllStructGetData($tResult, "success") = 0 Then
+    If Not IsArray($g_aGwNexusActiveConnection) Or Not _GwNexus_IsConnectionValid($g_aGwNexusActiveConnection) Then
         Return SetError(1, 0, 0)
     EndIf
-
-    Local $aResult[3]
-    $aResult[0] = DllStructGetData($tResult, "client_timestamp")
-    $aResult[1] = DllStructGetData($tResult, "server_timestamp")
-    $aResult[2] = DllStructGetData($tResult, "latency_ms")
-
-    Return $aResult
+    Return _GwNexus_HeartbeatEx($g_aGwNexusActiveConnection)
 EndFunc
 
 ; Extended version for specific connection
@@ -1292,7 +900,7 @@ Func _GwNexus_WaitForPipe($iPID, $iTimeoutMs = 5000)
 
     While TimerDiff($hTimer) < $iTimeoutMs
         ; Try to check if pipe exists
-        Local $aResult = DllCall("kernel32.dll", "dword", "WaitNamedPipeW", _
+        Local $aResult = DllCall("kernel32.dll", "bool", "WaitNamedPipeW", _
             "wstr", $sName, _
             "dword", 100)
 
@@ -1327,7 +935,7 @@ Func _GwNexus_EnumeratePipes()
         If $iPID = 0 Then ContinueLoop
 
         ; Open process
-        Local $aOpen = DllCall($hKernel, "handle", "OpenProcess", "dword", 0x1F0FFF, "bool", False, "dword", $iPID)
+        Local $aOpen = DllCall($hKernel, "handle", "OpenProcess", "dword", BitOR(0x0400, 0x0010), "bool", False, "dword", $iPID)
         If @error Or $aOpen[0] = 0 Then ContinueLoop
         Local $hProc = $aOpen[0]
 
@@ -1468,7 +1076,7 @@ Func _GwNexus_ScanAllClients()
         If $iPID = 0 Then ContinueLoop
 
         ; Open process
-        Local $aOpen = DllCall($hKernel, "handle", "OpenProcess", "dword", 0x1F0FFF, "bool", False, "dword", $iPID)
+        Local $aOpen = DllCall($hKernel, "handle", "OpenProcess", "dword", BitOR(0x0400, 0x0010), "bool", False, "dword", $iPID)
         If @error Or $aOpen[0] = 0 Then ContinueLoop
         Local $hProc = $aOpen[0]
 
@@ -1842,20 +1450,15 @@ Func _GwNexus_GetServerStatusEx($aConnection)
     Local $tResponse = _GwNexus_SendRequestEx($aConnection, $tRequest)
     If @error Then Return SetError(@error, 0, 0)
 
+    ; server_status is now inside the union, starts right after success+padding
     Local $tResult = DllStructCreate( _
         "byte success;" & _
         "byte padding[3];" & _
-        "byte union_data[1284];" & _
         "int status;" & _
         "uint client_count;" & _
         "uint64 uptime_ms;" & _
-        "char pipe_name[256]" _
-    )
-
-    DllCall("kernel32.dll", "none", "RtlMoveMemory", _
-        "ptr", DllStructGetPtr($tResult), _
-        "ptr", DllStructGetPtr($tResponse), _
-        "ulong_ptr", DllStructGetSize($tResult))
+        "char pipe_name[256]", _
+        DllStructGetPtr($tResponse))
 
     If DllStructGetData($tResult, "success") = 0 Then
         Return SetError(1, 0, 0)
@@ -1876,20 +1479,14 @@ Func _GwNexus_GetDLLStatusEx($aConnection)
     Local $tResponse = _GwNexus_SendRequestEx($aConnection, $tRequest)
     If @error Then Return SetError(@error, 0, 0)
 
+    ; dll_status is now inside the union, starts right after success+padding
     Local $tResult = DllStructCreate( _
         "byte success;" & _
         "byte padding[3];" & _
-        "byte union_data[1284];" & _
-        "byte server_status[272];" & _
         "int status;" & _
         "uint version;" & _
-        "char build_info[256]" _
-    )
-
-    DllCall("kernel32.dll", "none", "RtlMoveMemory", _
-        "ptr", DllStructGetPtr($tResult), _
-        "ptr", DllStructGetPtr($tResponse), _
-        "ulong_ptr", DllStructGetSize($tResult))
+        "char build_info[256]", _
+        DllStructGetPtr($tResponse))
 
     If DllStructGetData($tResult, "success") = 0 Then
         Return SetError(1, 0, 0)

@@ -254,8 +254,8 @@ void CleanupImGui() {
     // Mark as not initialized first to prevent any new rendering
     g_imguiInitialized = false;
 
-    // Wait a bit for any pending render to complete
-    Sleep(50);
+    // Brief yield to let any in-flight EndScene call finish checking the flag
+    SwitchToThread();
 
     try {
         // Cleanup ImGui DirectX resources
@@ -312,20 +312,6 @@ void RenderMainWindow() {
                     }
                 }
 
-                ImGui::Separator();
-                if (ImGui::MenuItem("Settings...")) {
-                    // Open settings window
-                }
-                ImGui::EndMenu();
-            }
-
-            if (ImGui::BeginMenu("Help")) {
-                if (ImGui::MenuItem("About...")) {
-                    // Show about dialog
-                }
-                if (ImGui::MenuItem("Documentation")) {
-                    // Open documentation
-                }
                 ImGui::EndMenu();
             }
 
@@ -736,13 +722,10 @@ DWORD WINAPI MainThread(LPVOID param) {
     CleanupImGui();
 #endif
 
-    // Wait a bit for pending operations
-    Sleep(100);
-
-    // Disable hooks
+    // Disable hooks - brief yield to let any in-flight hooked calls complete
     LOG_INFO("Disabling hooks...");
     MH_DisableHook(MH_ALL_HOOKS);
-    Sleep(50);
+    SwitchToThread();
 
     // Remove the hooks
     if (endscene_addr) {
@@ -847,43 +830,15 @@ BOOL WINAPI DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
     }
 
     case DLL_PROCESS_DETACH: {
-        // Signal shutdown to all components
+        // Minimize work under loader lock - only signal shutdown.
+        // MainThread handles all cleanup (pipe server, hooks, ImGui, etc.)
         GW::RequestShutdown();
         g_shutdownCV.notify_all();
 
-        // Stop Named Pipe server immediately if running
-#ifdef _DEBUG
-        if (g_pipeUI) {
-            try {
-                if (g_pipeUI->IsServerRunning()) {
-                    g_pipeUI->StopServer();
-                }
-            }
-            catch (...) {
-                // Ignore errors during emergency shutdown
-            }
-        }
-#else
-        if (g_pipeServer) {
-            try {
-                g_pipeServer->Stop();
-            }
-            catch (...) {
-                // Ignore errors during emergency shutdown
-            }
-        }
-#endif
-
-        // Wait for the main thread with timeout
+        // Wait for the main thread with short timeout
         HANDLE hThread = g_mainThread.get();
         if (hThread) {
-            DWORD result = WaitForSingleObject(hThread, 3000);
-
-            if (result == WAIT_TIMEOUT) {
-                LOG_ERROR("Main thread did not terminate in time (3 seconds)");
-                // Do NOT TerminateThread - let Windows clean up
-            }
-
+            WaitForSingleObject(hThread, 5000);
             // Thread handle will be closed by RAII destructor
         }
 
