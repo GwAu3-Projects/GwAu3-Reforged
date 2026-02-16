@@ -88,6 +88,11 @@ static bool g_isDragging = false;
 static bool g_isDraggingImgui = false;
 #endif
 
+// Game-thread timer for processing RPC calls when window is minimized
+// (EndScene is not called while minimized, so the timer takes over)
+static const UINT_PTR GAME_THREAD_TIMER_ID = 42;
+static UINT_PTR g_gameThreadTimer = 0;
+
 // NamedPipe Server
 GW::NamedPipeServer* g_pipeServer = nullptr;
 #ifdef _DEBUG
@@ -459,6 +464,25 @@ void RenderImGui() {
 }
 
 // ================================
+// Game-Thread Timer (for minimized window)
+// ================================
+
+// Timer callback - runs on the game thread via the message pump.
+// When the window is minimized, EndScene is not called, so this timer
+// ensures pending RPC calls (e.g. MoveTo) are still processed.
+VOID CALLBACK GameThreadTimerProc(HWND hwnd, UINT msg, UINT_PTR idTimer, DWORD dwTime) {
+    if (!GW::IsDllRunning()) return;
+
+#ifdef _DEBUG
+    if (g_pipeServer || g_pipeUI) {
+#else
+    if (g_pipeServer) {
+#endif
+        GW::RPCBridge::GetInstance().ProcessPendingCalls();
+    }
+}
+
+// ================================
 // DirectX Hooks
 // ================================
 
@@ -468,6 +492,24 @@ HRESULT WINAPI OnEndScene(IDirect3DDevice9* device) {
             return g_EndScene_Original(device);
         }
         return S_OK;
+    }
+
+    // On first call, capture game window and start the fallback timer.
+    // The timer ensures RPC calls are processed even when the window is
+    // minimized (DirectX stops calling EndScene while minimized).
+    if (!g_gameThreadTimer) {
+        if (!g_gameWindow) {
+            D3DDEVICE_CREATION_PARAMETERS params;
+            if (SUCCEEDED(device->GetCreationParameters(&params)) && params.hFocusWindow) {
+                g_gameWindow = params.hFocusWindow;
+            }
+        }
+        if (g_gameWindow) {
+            g_gameThreadTimer = SetTimer(g_gameWindow, GAME_THREAD_TIMER_ID, 50, GameThreadTimerProc);
+            if (g_gameThreadTimer) {
+                LOG_INFO("Game thread timer started (50ms interval)");
+            }
+        }
     }
 
     // Process pending RPC calls in game thread context
@@ -719,6 +761,13 @@ DWORD WINAPI MainThread(LPVOID param) {
     LOG_INFO("===========================================");
     LOG_INFO("Shutting down GwAu3...");
     LOG_INFO("===========================================");
+
+    // Kill the game-thread timer before disabling hooks
+    if (g_gameThreadTimer && g_gameWindow) {
+        KillTimer(g_gameWindow, GAME_THREAD_TIMER_ID);
+        g_gameThreadTimer = 0;
+        LOG_INFO("Game thread timer stopped");
+    }
 
     // Cleanup ImGui BEFORE hooks
 #ifdef _DEBUG
